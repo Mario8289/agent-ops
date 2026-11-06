@@ -1,0 +1,174 @@
+#!/bin/bash
+# System — compact Docker + resource dashboard for the "Agent Ops" Zellij layout.
+# Part of the agent-ops project: https://github.com/Mario8289/agent-ops
+#
+#   DOCKER   daemon state, running count, image/container/volume totals
+#            (no per-container list — `docker ps` for that)
+#   CPU      usage since the previous tick + 1m load
+#   RAM      used / total
+#   DISK     root filesystem
+#   SWAP     used / total (red once it is really in use)
+#   OPENCODE background `opencode serve` service state
+#   ⚠ TOP    a flag, shown only when something is off: CPU >= 70% for three
+#            ticks in a row, RAM >= 80%, or swap >= 50%. It names the program
+#            using the most memory / CPU, summed per program name (so 30
+#            browser processes count as one "chrome"). Otherwise no line.
+#            Thresholds: SYS_CPU_FLAG, SYS_RAM_FLAG, SYS_SWAP_FLAG.
+#
+# Redraws every 2s, but only when the frame changes, and overwrites in place
+# instead of clearing, so mouse selection survives long enough to copy text.
+# Set SYS_ONCE=1 to print one frame and exit (useful for testing).
+set -uo pipefail
+
+red= green= yellow= dim= bold= off=
+if [[ -t 1 ]]; then
+  red=$(tput setaf 1 2>/dev/null); green=$(tput setaf 2 2>/dev/null)
+  yellow=$(tput setaf 3 2>/dev/null)
+  dim=$(tput dim 2>/dev/null); bold=$(tput bold 2>/dev/null); off=$(tput sgr0 2>/dev/null)
+fi
+
+# bytes -> IEC human
+h() {
+  local n=${1:-0}
+  if (( n <= 0 )); then printf '0B'; return; fi
+  numfmt --to=iec-i --suffix=B --format='%.1f' "$n" 2>/dev/null || printf '%sB' "$n"
+}
+
+bar() {
+  local pct=${1:-0} width=${2:-10} i filled
+  (( pct < 0 )) && pct=0
+  (( pct > 100 )) && pct=100
+  filled=$(( pct * width / 100 ))
+  for ((i = 0; i < width; i++)); do
+    if (( i < filled )); then printf '█'; else printf '░'; fi
+  done
+}
+
+pct_color() {
+  local pct=${1:-0}
+  if (( pct >= 85 )); then printf '%s' "$red"
+  elif (( pct >= 65 )); then printf '%s' "$yellow"
+  else printf '%s' "$green"; fi
+}
+
+once=${SYS_ONCE:-0}
+prev=
+prev_total=0
+prev_idle=0
+prev_ts=0
+tick=0
+cpu_prev=${XDG_RUNTIME_DIR:-/tmp}/sys-cpu-prev.$$
+trap 'rm -f "$cpu_prev"' EXIT
+top_line=""
+cpu_hot=0
+cpu_flag=${SYS_CPU_FLAG:-70} ram_flag=${SYS_RAM_FLAG:-80} swap_flag=${SYS_SWAP_FLAG:-50}
+df_summary=""
+
+while true; do
+  # --- CPU: delta since the previous tick ---
+  read -r _cpu u n s i w irq sirq st _rest < /proc/stat
+  total=$((u + n + s + i + w + irq + sirq + st))
+  idle=$((i + w))
+  if (( prev_total > 0 )); then
+    dt=$((total - prev_total))
+    di=$((idle - prev_idle))
+    if (( dt > 0 )); then cpu_pct=$((100 * (dt - di) / dt)); else cpu_pct=0; fi
+  else
+    cpu_pct=0
+  fi
+  prev_total=$total
+  prev_idle=$idle
+
+  read -r l1 l5 l15 _rest < /proc/loadavg
+  read -r mem_total mem_used mem_avail < <(free -b | awk '/^Mem:/ {print $2, $3, $7}')
+  ram_pct=$((mem_total > 0 ? mem_used * 100 / mem_total : 0))
+  read -r disk_total disk_used disk_pct_raw < <(df -B1 / | awk 'NR==2 {print $2, $3, $5}')
+  disk_pct=${disk_pct_raw%\%}
+  read -r swap_total swap_used < <(free -b | awk '/^Swap:/ {print $2, $3}')
+  swap_total=${swap_total:-0} swap_used=${swap_used:-0}
+  swap_pct=$((swap_total > 0 ? swap_used * 100 / swap_total : 0))
+
+  # --- Top memory / CPU program: one ps pass, CPU as the delta of cputimes ---
+  now_ts=${EPOCHREALTIME/./}
+  elapsed_ms=$(( prev_ts > 0 ? (now_ts - prev_ts) / 1000 : 0 ))
+  prev_ts=$now_ts
+  [[ -f $cpu_prev ]] || : >"$cpu_prev"
+  top_line=$(ps -eo pid=,cputimes=,rss=,comm= 2>/dev/null | tee "$cpu_prev.new" |
+    awk -v ms="$elapsed_ms" -v prev="$cpu_prev" '
+      BEGIN { while ((getline l < prev) > 0) { split(l, f, " "); before[f[1]] = f[2] } }
+      { name = $4; for (i = 5; i <= NF; i++) name = name " " $i
+        rss[name] += $3
+        if (ms > 0 && ($1 in before)) cpu[name] += $2 - before[$1] }
+      END {
+        for (n in rss) { if (rss[n] > mr) { mr = rss[n]; mn = n } }
+        for (n in cpu) { if (cpu[n] > mc) { mc = cpu[n]; cn = n } }
+        printf "%s|%d|%s|%d", mn, mr * 1024, cn, (ms > 0 ? mc * 100000 / ms : 0) }')
+  mv -f "$cpu_prev.new" "$cpu_prev" 2>/dev/null
+  if (( cpu_pct >= cpu_flag )); then cpu_hot=$((cpu_hot + 1)); else cpu_hot=0; fi
+  IFS='|' read -r top_mem_name top_mem_bytes top_cpu_name top_cpu_pct <<<"$top_line"
+
+  # --- Docker: running count every tick; image/volume totals every third ---
+  if systemctl is-active --quiet docker 2>/dev/null; then
+    docker_up=1
+    running=$(( $(timeout 2 docker ps -q 2>/dev/null | wc -l) ))
+    if (( tick % 3 == 0 )); then
+      df_summary=$(timeout 3 docker system df --format '{{.Type}}|{{.TotalCount}}|{{.Size}}|{{.Reclaimable}}' 2>/dev/null |
+        awk -F'|' '
+          $1=="Images"       { img=$2 ($2==1 ? " image, " : " images, ") $3 }
+          $1=="Containers"   { ctr=$2 ($2==1 ? " container" : " containers") }
+          $1=="Local Volumes"{ vol=$2 ($2==1 ? " volume" : " volumes") }
+          END { printf "%s · %s · %s", img, ctr, vol }')
+    fi
+  else
+    docker_up=0
+    running=0
+    df_summary=""
+  fi
+
+  if pgrep -f "opencode serve --service" >/dev/null 2>&1; then svc=1; else svc=0; fi
+
+  # --- Build the frame: three lines, so the pane can stay short ---
+  frame=$(
+    printf '%sDOCKER%s ' "$bold" "$off"
+    if ((docker_up)); then
+      printf '%s●%s %s running' "$green" "$off" "$running"
+      [[ -n $df_summary ]] && printf ' · %s' "$df_summary"
+    else
+      printf '%s● down%s' "$red" "$off"
+    fi
+    printf '\n'
+    printf 'CPU %s%s%s %3d%%  load %s   RAM %s%s%s %3d%%  %s/%s\n' \
+      "$(pct_color "$cpu_pct")" "$(bar "$cpu_pct" 8)" "$off" "$cpu_pct" "$l1" \
+      "$(pct_color "$ram_pct")" "$(bar "$ram_pct" 8)" "$off" "$ram_pct" "$(h "$mem_used")" "$(h "$mem_total")"
+    printf 'DISK %s%s%s %3d%%  %s/%s' \
+      "$(pct_color "$disk_pct")" "$(bar "$disk_pct" 8)" "$off" "$disk_pct" "$(h "$disk_used")" "$(h "$disk_total")"
+    if (( swap_total > 0 )); then
+      swap_c=$dim
+      if (( swap_pct >= 50 )); then swap_c=$red; elif (( swap_used > 0 )); then swap_c=$yellow; fi
+      printf '   %sSWAP %s/%s%s' "$swap_c" "$(h "$swap_used")" "$(h "$swap_total")" "$off"
+    else
+      printf '   %sSWAP none%s' "$dim" "$off"
+    fi
+    printf '   OPENCODE %s\n' \
+      "$([[ $svc == 1 ]] && printf '%s●%s' "$green" "$off" || printf '%s○ down%s' "$red" "$off")"
+    flag_cpu=$(( cpu_hot >= 3 ))
+    flag_mem=$(( ram_pct >= ram_flag || (swap_total > 0 && swap_pct >= swap_flag) ))
+    if (( flag_cpu || flag_mem )); then
+      printf '%s⚠ TOP%s ' "$yellow" "$off"
+      (( flag_mem )) && printf ' mem %.14s %s ' "${top_mem_name:--}" "$(h "${top_mem_bytes:-0}")"
+      (( flag_cpu )) && printf ' cpu %.14s %s%%' "${top_cpu_name:-…}" "${top_cpu_pct:-0}"
+      printf '\n'
+    fi
+  )
+
+  if [[ $frame != "$prev" ]]; then
+    printf '\033[H'
+    printf '%s\n' "$frame" | sed $'s/$/\033[K/'
+    printf '\033[J'
+    prev=$frame
+  fi
+
+  ((tick++))
+  ((once)) && break
+  sleep 2
+done

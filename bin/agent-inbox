@@ -1,0 +1,347 @@
+#!/bin/bash
+# Agent Inbox — one pane that answers "what needs me right now?" for the
+# "Agent Ops" Zellij layout.
+#
+#   ASK    (yellow) a permission request is pending: the agent is blocked on you
+#   RUN    (green)  busy timestamp newer than idle: the agent is working
+#   IDLE   (yellow) the agent has gone idle: it waits for you
+#   FAIL   (red)    the log recorded a failure for the run
+#   DEAD   (red)    still busy but no update for 15m: died mid-run
+#   STOP   (yellow) the log recorded an INTERRUPTED event for the run
+#
+# Session state comes from the OpenCode server API (`opencode api session.list`)
+# through the adapter below, NOT from the private SQLite schema, so it survives
+# OpenCode upgrades. ASK / FAIL / STOP come from the agent-log plugin's log
+# (~/agent-runs/agent_health.log): the plugin subscribes to the official event
+# stream, and the file is the durable record of why a run ended.
+#
+# ADAPTER SEAM — `source_sessions` emits one tab-separated record per session:
+#   id  upd  busy  dir  title  tot  cost  kids  busykids  agent  model
+# (upd is epoch seconds). Backed by OpenCode today; a different harness (e.g.
+# pi.dev) only has to reimplement `source_fetch`, `source_sessions` and
+# `source_spend`.
+#
+# TOKENS is the running total for the whole session (input + output + cache read
+# + cache write). COST is the provider's reported dollar figure. MODEL is the
+# session's agent and model (e.g. "build·deepseek-v4-pro"). SUB is how many child
+# sessions the run has spawned (yellow when any are busy). TITLE is the session's
+# own title, rightmost, and grows into leftover width so a long title shows in
+# full when the pane is wide. GIT is its branch plus changed-file count.
+#
+# SUB, GIT, MODEL, TITLE, COST and PROJECT are dropped, in that order, when the
+# pane is too narrow. PROJECT survives down to 70; TITLE appears from ~90.
+#
+# A summary line sits above the table: "⚠N need you · M RUN · $X/24h". The
+# dollar figure is rolling-24h spend across all sessions, approximated from
+# session totals (the API exposes per-session cost, not per-message). Put a
+# number in ~/.config/agent-ops/budget to turn it red once that cap is reached.
+#
+# The # column numbers the rows as shown. The IDs are saved in that order to
+# $SESSION_LIST (default ~/.cache/opencode-session-list), so `sd 3` deletes row
+# 3. Rows re-sort when agent states change: check the number just before you
+# type it. SESSION is the full ID — opencode needs it whole, so it is never
+# clipped.
+#
+# The row for the session running in the focused pane is shown in reverse video;
+# the mapping comes from the pane title that `so` / `sc` / `sn` set.
+#
+# Checked every 2s, but redrawn only when something actually changed, so mouse
+# selection survives long enough to copy a session ID.
+# Machine-specific config written by `configure` (paths, source).
+[[ -r "${AGENT_OPS_CONFIG:-$HOME/.config/agent-ops/config}" ]] && source "${AGENT_OPS_CONFIG:-$HOME/.config/agent-ops/config}"
+
+LOG="${AGENT_LOG:-$HOME/agent-runs/agent_health.log}"
+BASE_NAME="Agent Inbox"
+SESSION_LIST="${SESSION_LIST:-${AGENT_SESSION_LIST:-${XDG_CACHE_HOME:-$HOME/.cache}/opencode-session-list}}"
+mkdir -p "$(dirname "$SESSION_LIST")"
+
+# ---- adapter seam ----
+# Emits one tab-separated record per session (see header). Today it reads the
+# OpenCode server API; a different harness only has to reimplement these three.
+ROWS_JQ='.data as $all
+  | ($all | map(select((.parentID // null) != null))) as $children
+  | $all | map(select((.parentID // null) == null))
+  | map(. as $s
+      | ($children | map(select(.parentID == $s.id))) as $mine
+      | [ $s.id,
+          (($s.time.updated // 0) / 1000 | floor),
+          (if (($s.time.busy // 0) > ($s.time.idle // 0)) then 1 else 0 end),
+          ($s.location.directory // ""),
+          ($s.title // ""),
+          (($s.tokens.input // 0) + ($s.tokens.output // 0)
+            + ($s.tokens.cache.read // 0) + ($s.tokens.cache.write // 0)),
+          ($s.cost // 0),
+          ($mine | length),
+          ([ $mine[] | select((.time.busy // 0) > (.time.idle // 0)) ] | length),
+          ($s.agent // ""),
+          ($s.model.id // "") ])
+  | sort_by(.[1]) | reverse | .[0:12]
+  | .[] | @tsv'
+
+# Rolling 24h spend across all sessions, approximated from session totals.
+SPEND_JQ='[ .data[] | select((.time.updated // 0) > ((now - 86400) * 1000)) | (.cost // 0) ] | add // 0'
+
+_raw=
+source_fetch()    { _raw=$(opencode api session.list 2>/dev/null); }
+source_sessions() { printf '%s' "$_raw" | jq -r "$ROWS_JQ" 2>/dev/null; }
+source_spend()    { printf '%s' "$_raw" | jq -r "$SPEND_JQ" 2>/dev/null; }
+
+# Optional daily budget in dollars. When set and the 24h spend reaches it, the
+# summary line's spend turns red. One line, e.g. "4.64"; absent = no threshold.
+BUDGET_FILE="${AGENT_BUDGET_FILE:-$HOME/.config/agent-ops/budget}"
+
+if [[ -t 1 ]]; then
+  green=$(tput setaf 2 2>/dev/null) yellow=$(tput setaf 3 2>/dev/null) red=$(tput setaf 1 2>/dev/null)
+  dim=$(tput dim 2>/dev/null) bold=$(tput bold 2>/dev/null) rev=$(tput rev 2>/dev/null) off=$(tput sgr0 2>/dev/null)
+fi
+
+# 949133 -> 949k, 1234567 -> 1.2M
+human() {
+  local n=${1:-0}
+  if (( n < 1000 )); then printf '%d' "$n"
+  elif (( n < 1000000 )); then printf '%dk' $(( n / 1000 ))
+  else printf '%d.%dM' $(( n / 1000000 )) $(( (n % 1000000) / 100000 ))
+  fi
+}
+
+# Clip to n characters without cutting mid-word or mid-byte.
+clip() {
+  local s=$1 n=$2
+  if (( ${#s} > n )); then printf '%s' "${s:0:n-1}…"; else printf '%s' "$s"; fi
+}
+
+prev=
+prev_title=
+
+# Git status cache: running `git status` every 2s over up to 12 projects is too
+# slow, so each directory is checked at most every GIT_INTERVAL seconds. Values
+# are ASCII so the GIT column pads cleanly: "." = not a repo, "branch" = clean,
+# "branch+N" = N changed files.
+GIT_INTERVAL=30
+declare -A g_last=() g_repo=() g_n=() g_branch=()
+
+while true; do
+  now=$(date +%s)
+  cols=$(tput cols 2>/dev/null || echo 120)
+  (( cols > 40 )) || cols=120
+
+  # Drop optional columns when the pane is narrow. The ID must stay whole (it
+  # is meant to be copied).
+  show_git=1; show_sub=1; show_model=1; show_title=1; show_proj=1; show_cost=1
+  fixed=$(( 3 + 4 + 1 + 6 + 1 + 30 + 1 + 7 + 1 ))  # # STS AGE SESSION TOKENS
+  width=$(( fixed + 14 + 4 + 18 + 16 + 13 + 7 ))   # + GIT SUB MODEL TITLE PROJECT COST
+  if (( width > cols )); then show_sub=0;    width=$(( width - 4 )); fi
+  if (( width > cols )); then show_git=0;    width=$(( width - 14 )); fi
+  if (( width > cols )); then show_model=0;  width=$(( width - 18 )); fi
+  if (( width > cols )); then show_title=0;  width=$(( width - 16 )); fi
+  if (( width > cols )); then show_cost=0;   width=$(( width - 7 )); fi
+  if (( width > cols )); then show_proj=0; fi
+
+  # TITLE is flexible: it grows into whatever width is left over, so a long
+  # title shows in full when the pane is wide rather than always clipping.
+  title_w=16
+  if (( show_title )); then
+    title_w=$(( 16 + cols - width )); (( title_w > 80 )) && title_w=80
+  fi
+  # Map log events onto sessions. The log tag is the id prefix — 8 chars in
+  # lines written so far, 12 in newer plugin versions. The leading chars are
+  # time-derived, so prefix collisions do happen; an ambiguous tag is dropped
+  # rather than pinned on the wrong session.
+  source_fetch
+  data=$(source_sessions)
+  spend=$(source_spend)
+  [[ $spend =~ ^-?[0-9] ]] || spend=0
+
+  budget=
+  [[ -r $BUDGET_FILE ]] && budget=$(head -n1 "$BUDGET_FILE" 2>/dev/null | tr -d '[:space:]')
+
+  # Which session is in the pane that has focus right now? `so`/`sc`/`sn` put the ID in
+  # the pane title; anything else (a plain shell, this pane) yields nothing.
+  focused_ses=
+  if [[ -n ${ZELLIJ_PANE_ID:-} ]]; then
+    focused_ses=$(zellij action list-panes --json 2>/dev/null |
+      jq -r '[.[] | select(.is_focused and (.is_plugin | not)) | .title][0] // empty' 2>/dev/null |
+      grep -oE 'ses_[A-Za-z0-9]{20,}' | head -n 1)
+  fi
+
+  unset ev; declare -A ev=()
+  if [[ -r $LOG && -n $data ]]; then
+    unset ltag ltext; declare -a ltag=() ltext=()
+    while IFS= read -r line; do
+      tag=${line#*] [}                 # "ses_e539 brain] FAILED provider.quota: ..."
+      [[ $tag == *'] '* ]] || continue
+      text=${tag#*] }                  # "FAILED provider.quota: ..."
+      case ${text%% *} in
+        WAITING|RESUMED|IDLE|INTERRUPTED|RETRY|FAILED|LOADED)
+          ltag+=("${tag%% *}"); ltext+=("$text") ;;
+      esac
+    done < <(tail -n 400 "$LOG" 2>/dev/null)
+
+    unset ids; declare -a ids=()
+    while IFS=$'\t' read -r id _; do [[ -n $id ]] && ids+=("$id"); done <<< "$data"
+
+    for i in "${!ltag[@]}"; do
+      t=${ltag[i]} hits=0 hit=
+      for id in "${ids[@]}"; do
+        if [[ $id == "$t"* ]]; then hits=$(( hits + 1 )); hit=$id; fi
+      done
+      (( hits == 1 )) && ev[$hit]=${ltext[i]}
+    done
+  fi
+
+  rows= urgent=0 running=0
+  while IFS=$'\t' read -r id upd busy dir stitle tot cost kids busykids agent modelid; do
+    [[ -n $id ]] || continue
+    age=$(( now - upd ))
+    if (( age < 3600 )); then a="$(( age / 60 ))m"
+    elif (( age < 86400 )); then
+      h=$(( age / 3600 )); m=$(( age % 3600 / 60 ))
+      if (( m == 0 )); then a="${h}h"; else a="${h}h${m}m"; fi
+    else a="$(( age / 86400 ))d"; fi
+
+    # A pending permission request outranks busy/idle: the agent is blocked
+    # even though its busy flag may still be set.
+    st= c=
+    e=${ev[$id]:-}
+    case $e in
+      WAITING*)     st=ASK;       c=$yellow; urgent=$(( urgent + 1 )) ;;
+      FAILED*)      st=FAIL;      c=$red;    urgent=$(( urgent + 1 )) ;;
+      INTERRUPTED*) st=STOP;      c=$yellow ;;
+    esac
+
+    if [[ -z $st ]]; then
+      if (( busy == 1 && age > 900 )); then
+        # Busy flag still set but no update for 15m: the run died mid-flight
+        # (quota, crash, kill) and will never finish. Streaming output updates
+        # the session continuously, so this does not catch slow-but-alive runs.
+        st=DEAD; c=$red; urgent=$(( urgent + 1 ))
+      elif (( busy == 1 )); then st=RUN; c=$green; running=$(( running + 1 ))
+      else st=IDLE; c=$yellow; fi
+    fi
+
+    # Rows needing attention rise to the top, then working, then idle.
+    case $st in
+      ASK|FAIL|DEAD|STOP) rank=0 ;;
+      RUN) rank=1 ;;
+      *) rank=2 ;;
+    esac
+
+    row=$(printf '%s%-4s%s %-6s ' "$bold$c" "$st" "$off" "$a")
+    if [[ -n $focused_ses && $id == "$focused_ses" ]]; then
+      row+="${rev}${id}${off} "
+    else
+      row+="${dim}${id}${off} "
+    fi
+    (( show_proj )) && row+=$(printf '%-12s ' "$(clip "${dir##*/}" 12)")
+    (( show_model )) && row+=$(printf '%-18s ' "$(clip "${agent:+$agent·}$modelid" 18)")
+    if (( show_git )); then
+      gcell= gcol=$dim
+      if [[ -z $dir ]]; then
+        gcell="."
+      else
+        if (( now - ${g_last[$dir]:-0} >= GIT_INTERVAL )); then
+          g_last[$dir]=$now
+          if [[ -d "$dir/.git" || -f "$dir/.git" ]]; then
+            g_repo[$dir]=1
+            g_n[$dir]=$(git -C "$dir" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+            g_branch[$dir]=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null)
+          else
+            g_repo[$dir]=0
+          fi
+        fi
+        if [[ ${g_repo[$dir]:-0} == 0 ]]; then
+          gcell="."
+        else
+          gcell=$(clip "${g_branch[$dir]:-?}" 10)
+          if (( ${g_n[$dir]:-0} == 0 )); then
+            gcol=$green
+          else
+            gcell="$gcell+${g_n[$dir]}"
+            gcol=$yellow
+          fi
+        fi
+      fi
+      row+=$(printf '%s%-14s%s ' "$gcol" "$gcell" "$off")
+    fi
+    if (( show_sub )); then
+      if (( kids > 0 )); then
+        sc=$dim; (( busykids > 0 )) && sc=$yellow
+        row+=$(printf '%s%-4s%s ' "$sc" "$kids" "$off")
+      else
+        row+=$(printf '%s%-4s%s ' "$dim" "-" "$off")
+      fi
+    fi
+    toks=-; (( tot > 0 )) && toks=$(human "$tot")
+    row+=$(printf '%-6s ' "$toks")
+    if (( show_cost )); then
+      costs=-
+      if [[ $cost != 0 && $cost != 0.0 ]]; then
+        costs=$(printf '$%.2f' "$cost"); [[ $costs == '$0.00' ]] && costs='<$0.01'
+      fi
+      row+=$(printf '%-7s ' "$costs")
+    fi
+    (( show_title )) && row+=$(clip "$stitle" "$title_w")
+    rows+="$rank"$'\t'"$id"$'\t'"$row"$'\n'
+  done <<< "$data"
+
+  # One-line summary: what needs you, what's running, and rolling 24h spend.
+  spends=-
+  if [[ $spend != 0 && $spend != 0.0 && -n $spend ]]; then
+    spends=$(printf '$%.2f' "$spend"); [[ $spends == '$0.00' ]] && spends='<$0.01'
+  fi
+  over=0
+  if [[ -n $budget && $budget =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    awk -v a="$spend" -v b="$budget" 'BEGIN { exit !(a >= b) }' && over=1
+  fi
+  summary=
+  (( urgent > 0 )) && summary+="${red}⚠${urgent} need you${off}"
+  [[ -n $summary ]] && summary+=" · "
+  summary+="${green}${running} RUN${off}"
+  if [[ $spends != - ]]; then
+    summary+=" · "
+    (( over )) && summary+="$red"
+    summary+="${spends}/24h"
+    (( over )) && summary+="$off"
+  fi
+
+  header=$(printf '%s%-3s%-4s %-6s ' "$bold" '#' STS AGE)
+  header+=$(printf '%-30s ' SESSION)
+  (( show_proj )) && header+=$(printf '%-12s ' PROJECT)
+  (( show_model )) && header+=$(printf '%-18s ' MODEL)
+  (( show_git ))   && header+=$(printf '%-14s ' GIT)
+  (( show_sub ))   && header+=$(printf '%-4s ' SUB)
+  header+=$(printf '%-6s ' TOKENS)
+  (( show_cost )) && header+=$(printf '%-7s ' COST)
+  (( show_title )) && header+=TITLE
+  header+=$off
+
+  if [[ -n $rows ]]; then
+    lines=$(tput lines 2>/dev/null || echo 40)
+    max_rows=$(( lines - 3 )); (( max_rows < 5 )) && max_rows=5
+    sorted=$(printf '%s' "$rows" | sort -n -k1,1 | head -n "$max_rows")
+    body= n=0 listed=
+    while IFS=$'\t' read -r _ sid line; do
+      n=$(( n + 1 ))
+      body+=$(printf '%s%2d%s ' "$dim" "$n" "$off")"$line"$'\n'
+      listed+="$sid"$'\n'
+    done <<< "$sorted"
+    printf '%s' "$listed" > "$SESSION_LIST"
+    frame="$summary"$'\n'"$header"$'\n'"${body%$'\n'}"
+  else
+    : > "$SESSION_LIST"
+    frame="$summary"$'\n'"$header"$'\n'"${dim}no sessions in the last 24h${off}"
+  fi
+
+  if (( urgent > 0 )); then pane_title="$BASE_NAME ⚠${urgent}"; else pane_title="$BASE_NAME"; fi
+  if [[ -n ${ZELLIJ_PANE_ID:-} && $pane_title != "$prev_title" ]]; then
+    zellij action rename-pane -p "$ZELLIJ_PANE_ID" "$pane_title" >/dev/null 2>&1
+    prev_title=$pane_title
+  fi
+
+  if [[ $cols$frame != "$prev" ]]; then
+    clear
+    printf '%s\n' "$frame"
+    prev=$cols$frame
+  fi
+  sleep 2
+done

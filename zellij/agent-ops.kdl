@@ -1,0 +1,51 @@
+// "Agent Ops" — watch coding agents while you work in the same window.
+// Part of the agent-ops project: https://github.com/Mario8289/agent-ops
+//
+// One column, tuned for a tall narrow window (~78 cols x 65 rows, e.g. 30% of a
+// screen):
+//   top    (20%): Agent Inbox — one row per recent session, worst first,
+//                 with its status, age, and total tokens / cost so far. Retitles
+//                 itself "Agent
+//                 Inbox ⚠N" when N sessions need you. Needs the agent-log
+//                 plugin (writes the log) and agent-inbox (reads the OpenCode
+//                 server API).
+//   middle (70%): project shells where OpenCode runs, stacked — switch with
+//                 Alt+Up/Down or click a collapsed title. Add one at runtime
+//                 with `znp pcode/agent-ant` (no argument = home); remove with
+//                 `zellij action close-pane`.
+//   bottom (10%): System — three lines: Docker (state + counts), CPU/load/RAM,
+//                 disk/swap/OpenCode service. A fourth "⚠ TOP" line appears only
+//                 when CPU/RAM/swap is high, naming the program responsible.
+//                 For a scratch shell, add a pane with `znp` or Ctrl+t n.
+//
+// The raw event stream still exists if you want it: `tail -f
+// ~/agent-runs/agent_health.log`, or `zellij run -- agent-log` for a pane.
+//
+// Switch tabs/panes with Zellij's keys (Ctrl+t / Alt+arrows). Plain `zellij`
+// opens this layout (see config.kdl).
+//
+// The panes run ~/.local/bin/agent-inbox and ~/.local/bin/sys.
+
+layout {
+    default_tab_template {
+        pane size=1 borderless=true {
+            plugin location="zellij:tab-bar"
+        }
+        children
+        pane size=2 borderless=true {
+            plugin location="zellij:status-bar"
+        }
+    }
+
+    tab name="Agent Ops" {
+        pane split_direction="horizontal" {
+            pane name="Agent Inbox" command="agent-inbox" size="20%"
+            pane stacked=true size="70%" {
+                pane name="dotfiles"  cwd="/home/marriotta/pcode/dotfiles" focus=true expanded=true
+                pane name="agent-ant" cwd="/home/marriotta/pcode/agent-ant"
+                pane name="brain"     cwd="/home/marriotta/pcode/brain"
+            }
+            pane name="System" command="sys" size="10%"
+        }
+    }
+}
