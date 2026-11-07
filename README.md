@@ -32,8 +32,8 @@ OpenCode upgrade.
 ```
 
 - **`agent-inbox`** — one row per recent session, worst first, with status, age,
-  tokens, cost, model, git state, child-session count, and title. Columns drop
-  gracefully as the pane narrows.
+  tokens, cost, model, git state, PR/CI state, child-session count, and title.
+  Columns drop gracefully as the pane narrows.
 - **`agent-log` plugin** — subscribes to OpenCode's event stream and appends
   durable lines to a log (the inbox uses this for *why* a run ended). Also fires
   desktop and phone notifications.
@@ -58,7 +58,7 @@ session's busy/idle timestamps.
 ## Install
 
 Dependencies: `jq`, `zellij`, `git`, `curl`, `opencode` (and `notify-send` for
-desktop popups, `docker` for the sys pane).
+desktop popups, `docker` for the sys pane, `gh` for the PR/CI column).
 
 ```sh
 git clone https://github.com/Mario8289/agent-ops.git
@@ -134,6 +134,8 @@ derivation, columns, summary, notifications, `so`/`sd` — stays put.
 ## Caveats
 
 - Built against the current OpenCode v2 API. Pin/document the version you run.
+- The PR/CI column uses `gh` (GitHub only for now; `glab` can be added for
+  GitLab) and is checked at most once per minute per project.
 - The **24h spend** figure sums per-session cost for sessions updated in the last
   day (the API exposes session totals, not per-message), so it's an
   approximation, not an invoice.

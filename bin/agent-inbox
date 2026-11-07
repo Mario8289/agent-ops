@@ -26,10 +26,12 @@
 # session's agent and model (e.g. "build·deepseek-v4-pro"). SUB is how many child
 # sessions the run has spawned (yellow when any are busy). TITLE is the session's
 # own title, rightmost, and grows into leftover width so a long title shows in
-# full when the pane is wide. GIT is its branch plus changed-file count.
+# full when the pane is wide. GIT is its branch plus changed-file count. PR is
+# the open pull request for that branch with its CI state ("#12" green = passing,
+# "#12!" red = failing, "#12?" yellow = pending/draft, "-" = no open PR).
 #
-# SUB, GIT, MODEL, TITLE, COST and PROJECT are dropped, in that order, when the
-# pane is too narrow. PROJECT survives down to 70; TITLE appears from ~90.
+# SUB, PR, GIT, MODEL, TITLE, COST and PROJECT are dropped, in that order, when
+# the pane is too narrow. PROJECT survives down to 70; TITLE appears from ~90.
 #
 # A summary line sits above the table: "⚠N need you · M RUN · $X/24h". The
 # dollar figure is rolling-24h spend across all sessions, approximated from
@@ -120,6 +122,12 @@ prev_title=
 GIT_INTERVAL=30
 declare -A g_last=() g_repo=() g_n=() g_branch=()
 
+# PR/CI cache: `gh pr view` is a network call, so check at most every PR_INTERVAL
+# seconds per directory. Values are ASCII so the PR column pads cleanly: "-" =
+# no open PR, "#N" = CI green, "#N!" = failing, "#N?" = pending/draft.
+PR_INTERVAL=60
+declare -A pr_last=() pr_cell=()
+
 while true; do
   now=$(date +%s)
   cols=$(tput cols 2>/dev/null || echo 120)
@@ -127,10 +135,11 @@ while true; do
 
   # Drop optional columns when the pane is narrow. The ID must stay whole (it
   # is meant to be copied).
-  show_git=1; show_sub=1; show_model=1; show_title=1; show_proj=1; show_cost=1
+  show_git=1; show_pr=1; show_sub=1; show_model=1; show_title=1; show_proj=1; show_cost=1
   fixed=$(( 3 + 4 + 1 + 6 + 1 + 30 + 1 + 7 + 1 ))  # # STS AGE SESSION TOKENS
-  width=$(( fixed + 14 + 4 + 18 + 16 + 13 + 7 ))   # + GIT SUB MODEL TITLE PROJECT COST
+  width=$(( fixed + 14 + 7 + 4 + 18 + 16 + 13 + 7 ))  # + GIT PR SUB MODEL TITLE PROJECT COST
   if (( width > cols )); then show_sub=0;    width=$(( width - 4 )); fi
+  if (( width > cols )); then show_pr=0;     width=$(( width - 7 )); fi
   if (( width > cols )); then show_git=0;    width=$(( width - 14 )); fi
   if (( width > cols )); then show_model=0;  width=$(( width - 18 )); fi
   if (( width > cols )); then show_title=0;  width=$(( width - 16 )); fi
@@ -263,6 +272,38 @@ while true; do
       fi
       row+=$(printf '%s%-14s%s ' "$gcol" "$gcell" "$off")
     fi
+    if (( show_pr )); then
+      pcell=- pcol=$dim
+      if [[ -n $dir && ${g_repo[$dir]:-0} == 1 ]]; then
+        if (( now - ${pr_last[$dir]:-0} >= PR_INTERVAL )); then
+          pr_last[$dir]=$now
+          branch=${g_branch[$dir]:-}
+          pr_cell[$dir]="-"
+          if [[ -n $branch ]]; then
+            pr_cell[$dir]=$(cd "$dir" && timeout 8 gh pr view "$branch" --json number,state,isDraft,statusCheckRollup 2>/dev/null |
+              jq -r '
+                if (. | type) != "object" or .state != "OPEN" then "-"
+                elif .isDraft then "#\(.number)?"
+                else
+                  ([.statusCheckRollup[]? | select(.conclusion == "FAILURE")] | length) as $fail
+                  | ([.statusCheckRollup[]? | select(.status != "COMPLETED")] | length) as $pend
+                  | if $fail > 0 then "#\(.number)!"
+                    elif $pend > 0 then "#\(.number)?"
+                    else "#\(.number)" end
+                end' 2>/dev/null)
+            [[ -n ${pr_cell[$dir]} ]] || pr_cell[$dir]="-"
+          fi
+        fi
+        pcell=${pr_cell[$dir]:-"-"}
+        case $pcell in
+          -) pcol=$dim ;;
+          *!) pcol=$red ;;
+          *?) pcol=$yellow ;;
+          *) pcol=$green ;;
+        esac
+      fi
+      row+=$(printf '%s%-7s%s ' "$pcol" "$pcell" "$off")
+    fi
     if (( show_sub )); then
       if (( kids > 0 )); then
         sc=$dim; (( busykids > 0 )) && sc=$yellow
@@ -309,6 +350,7 @@ while true; do
   (( show_proj )) && header+=$(printf '%-12s ' PROJECT)
   (( show_model )) && header+=$(printf '%-18s ' MODEL)
   (( show_git ))   && header+=$(printf '%-14s ' GIT)
+  (( show_pr ))    && header+=$(printf '%-7s ' PR)
   (( show_sub ))   && header+=$(printf '%-4s ' SUB)
   header+=$(printf '%-6s ' TOKENS)
   (( show_cost )) && header+=$(printf '%-7s ' COST)
