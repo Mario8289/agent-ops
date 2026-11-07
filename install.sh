@@ -28,6 +28,7 @@ link() { # link <src> <dst>
 
 printf 'repo: %s\n\n' "$REPO"
 link "$REPO/bin/agent-inbox"         "$BIN_DIR/agent-inbox"
+link "$REPO/bin/agent-log"           "$BIN_DIR/agent-log"
 link "$REPO/bin/sys"                 "$BIN_DIR/sys"
 link "$REPO/plugin/agent-log"        "$PLUGIN_DIR/agent-log"
 link "$REPO/zellij/agent-ops.kdl"    "$LAYOUT_DIR/agent-ops.kdl"

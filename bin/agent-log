@@ -1,0 +1,49 @@
+#!/bin/bash
+# Follow the agent event log written by the agent-log OpenCode plugin.
+# Part of the agent-ops project: https://github.com/Mario8289/agent-ops
+#
+# Event lines:  [timestamp] [session8 project] EVENT detail
+# Startup:      [timestamp] LOADED project
+# The session12 prefix matches the full ID shown in the Agent Inbox pane.
+# Colours: waiting=yellow, resumed=blue, idle=green, interrupted=magenta, failed=red, loaded=dim.
+LOG="${AGENT_LOG:-$HOME/agent-runs/agent_health.log}"
+mkdir -p "$(dirname "$LOG")"
+touch "$LOG"
+
+if [[ -t 1 ]]; then
+  red=$(tput setaf 1 2>/dev/null)
+  green=$(tput setaf 2 2>/dev/null)
+  yellow=$(tput setaf 3 2>/dev/null)
+  blue=$(tput setaf 4 2>/dev/null)
+  magenta=$(tput setaf 5 2>/dev/null)
+  dim=$(tput dim 2>/dev/null)
+  off=$(tput sgr0 2>/dev/null)
+fi
+
+cols=$(tput cols 2>/dev/null || echo 100)
+(( cols > 20 )) || cols=100
+
+prev=
+stdbuf -oL tail -n 100 -F "$LOG" | while IFS= read -r line; do
+  # A retried event can land twice in the same second; show it once.
+  [[ "$line" == "$prev" ]] && continue
+  prev="$line"
+
+  # Keep the pane readable. The session/project prefix is at the start, so
+  # trimming the tail is safe.
+  if (( ${#line} > cols )); then
+    line="${line:0:$((cols - 3))}..."
+  fi
+
+  case "$line" in
+    *"] WAITING "*) c=$yellow ;;
+    *"] RESUMED "*) c=$blue ;;
+    *"] IDLE "*)        c=$green ;;
+    *"] INTERRUPTED "*) c=$magenta ;;
+    *"] RETRY "*)       c=$magenta ;;
+    *"] FAILED "*)      c=$red ;;
+    *" LOADED "*)   c=$dim ;;
+    *)              c= ;;
+  esac
+  printf '%s%s%s\n' "$c" "$line" "$off"
+done
