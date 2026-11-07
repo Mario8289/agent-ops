@@ -25,13 +25,13 @@
 # + cache write). COST is the provider's reported dollar figure. MODEL is the
 # session's agent and model (e.g. "build·deepseek-v4-pro"). SUB is how many child
 # sessions the run has spawned (yellow when any are busy). TITLE is the session's
-# own title (clipped to 24 characters). GIT is its branch plus changed-file
-# count. PR is the open pull request for that branch with its CI state ("#12"
-# green = passing, "#12!" red = failing, "#12?" yellow = pending/draft, "-" = no
-# open PR).
+# own title; it grows into leftover width so the table fills a wide pane. GIT is
+# its branch plus changed-file count. PR is the open pull request for that branch
+# with its CI state ("#12" green = passing, "#12!" red = failing, "#12?" yellow =
+# pending/draft, "-" = no open PR).
 #
 # SUB, PR, GIT, MODEL, TITLE, COST and PROJECT are dropped, in that order, when
-# the pane is too narrow. PROJECT survives down to 70; TITLE appears from ~98.
+# the pane is too narrow. PROJECT survives down to 70; TITLE appears from ~90.
 #
 # A summary line sits above the table: "⚠N need you · M RUN · $X/24h". The
 # dollar figure is rolling-24h spend across all sessions, approximated from
@@ -137,14 +137,21 @@ while true; do
   # is meant to be copied).
   show_git=1; show_pr=1; show_sub=1; show_model=1; show_title=1; show_proj=1; show_cost=1
   fixed=$(( 3 + 4 + 1 + 6 + 1 + 30 + 1 + 7 + 1 ))  # # STS AGE SESSION TOKENS
-  width=$(( fixed + 14 + 7 + 4 + 18 + 24 + 13 + 7 ))  # + GIT PR SUB MODEL TITLE PROJECT COST
+  width=$(( fixed + 14 + 7 + 4 + 18 + 16 + 13 + 7 ))  # + GIT PR SUB MODEL TITLE PROJECT COST
   if (( width > cols )); then show_sub=0;    width=$(( width - 4 )); fi
   if (( width > cols )); then show_pr=0;     width=$(( width - 7 )); fi
   if (( width > cols )); then show_git=0;    width=$(( width - 14 )); fi
   if (( width > cols )); then show_model=0;  width=$(( width - 18 )); fi
-  if (( width > cols )); then show_title=0;  width=$(( width - 24 )); fi
+  if (( width > cols )); then show_title=0;  width=$(( width - 16 )); fi
   if (( width > cols )); then show_cost=0;   width=$(( width - 7 )); fi
   if (( width > cols )); then show_proj=0; fi
+
+  # TITLE is flexible: it grows into whatever width is left over, so the table
+  # fills the pane on a wide screen instead of leaving blank space.
+  title_w=16
+  if (( show_title )); then
+    title_w=$(( 16 + cols - width )); (( title_w < 16 )) && title_w=16
+  fi
   # Map log events onto sessions. The log tag is the id prefix — 8 chars in
   # lines written so far, 12 in newer plugin versions. The leading chars are
   # time-derived, so prefix collisions do happen; an ambiguous tag is dropped
@@ -235,7 +242,7 @@ while true; do
       row+="${dim}${id}${off} "
     fi
     (( show_proj )) && row+=$(printf '%-12s ' "$(clip "${dir##*/}" 12)")
-    (( show_title )) && row+=$(printf '%-24s ' "$(clip "$stitle" 24)")
+    (( show_title )) && row+=$(printf "%-${title_w}s " "$(clip "$stitle" "$title_w")")
     (( show_model )) && row+=$(printf '%-18s ' "$(clip "${agent:+$agent·}$modelid" 18)")
     if (( show_git )); then
       gcell= gcol=$dim
@@ -341,7 +348,7 @@ while true; do
   header=$(printf '%s%-3s%-4s %-6s ' "$bold" '#' STS AGE)
   header+=$(printf '%-30s ' SESSION)
   (( show_proj )) && header+=$(printf '%-12s ' PROJECT)
-  (( show_title )) && header+=$(printf '%-24s ' TITLE)
+  (( show_title )) && header+=$(printf "%-${title_w}s " TITLE)
   (( show_model )) && header+=$(printf '%-18s ' MODEL)
   (( show_git ))   && header+=$(printf '%-14s ' GIT)
   (( show_pr ))    && header+=$(printf '%-7s ' PR)
