@@ -26,7 +26,8 @@
 # session's agent and model (e.g. "build/deepseek-v4-pro"; ASCII "/" so the
 # padded column width is exact). SUB is how many child
 # sessions the run has spawned (yellow when any are busy). TITLE is the session's
-# own title; it grows into leftover width so the table fills a wide pane. GIT is
+# own title; leftover width grows TITLE first, then MODEL, so a wide pane shows
+# complete titles and model names instead of padding TITLE while MODEL is cut. GIT is
 # its branch plus changed-file count. PR is the open pull request for that branch
 # with its CI state ("#12" green = passing, "#12!" red = failing, "#12?" yellow =
 # pending/draft, "-" = no open PR).
@@ -162,8 +163,8 @@ while true; do
   # or two does not flip a column on and off. Shrink immediately while the pane
   # is narrower than the current layout (fit beats stability); grow only when
   # there are HYST columns to spare. COL_W values include every trailing space,
-  # so `width` equals the real rendered line length and the TITLE flex math
-  # (title_w = 16 + cols - width) lands exactly on the pane edge.
+  # so `width` is the base layout width (TITLE and MODEL at their minimums); the
+  # leftover `cols - width` is split between TITLE and MODEL further down.
   n=$prev_n
   while (( n > 0 && cols < COL_W[n] )); do n=$(( n - 1 )); done
   while (( n < 7 && cols >= COL_W[n + 1] + HYST )); do n=$(( n + 1 )); done
@@ -181,12 +182,6 @@ while true; do
   (( n >= 6 )) && show_pr=1
   (( n >= 7 )) && show_sub=1
 
-  # TITLE is flexible: it grows into whatever width is left over, so the table
-  # fills the pane on a wide screen instead of leaving blank space.
-  title_w=16
-  if (( show_title )); then
-    title_w=$(( 16 + cols - width )); (( title_w < 16 )) && title_w=16
-  fi
   # Map log events onto sessions. The log tag is the id prefix — 8 chars in
   # lines written so far, 12 in newer plugin versions. The leading chars are
   # time-derived, so prefix collisions do happen; an ambiguous tag is dropped
@@ -195,6 +190,33 @@ while true; do
   data=$(source_sessions)
   spend=$(source_spend)
   [[ $spend =~ ^-?[0-9] ]] || spend=0
+
+  # Flex the leftover width across the content columns instead of dumping it all
+  # into TITLE. TITLE grows first, but only until the longest title fits; then
+  # MODEL grows until the longest agent/model fits. Whatever is left after both
+  # are fully visible goes back to TITLE. This stops a short-title table from
+  # showing a huge empty TITLE column while MODEL is still clipped.
+  max_title=0 max_model=0
+  while IFS=$'\t' read -r _id _upd _busy _dir stitle _tot _cost _kids _bk agent modelid; do
+    [[ -n $_id ]] || continue
+    (( ${#stitle} > max_title )) && max_title=${#stitle}
+    mm="${agent:+$agent/}$modelid"
+    (( ${#mm} > max_model )) && max_model=${#mm}
+  done <<< "$data"
+
+  title_w=16 model_w=18
+  if (( show_title )); then
+    extra=$(( cols - width )); (( extra < 0 )) && extra=0
+    title_need=$(( max_title > 16 ? max_title - 16 : 0 ))
+    a=$(( extra < title_need ? extra : title_need ))
+    title_w=$(( 16 + a )); extra=$(( extra - a ))
+    if (( show_model )); then
+      model_need=$(( max_model > 18 ? max_model - 18 : 0 ))
+      b=$(( extra < model_need ? extra : model_need ))
+      model_w=$(( 18 + b )); extra=$(( extra - b ))
+    fi
+    title_w=$(( title_w + extra ))
+  fi
 
   budget=
   [[ -r $BUDGET_FILE ]] && budget=$(head -n1 "$BUDGET_FILE" 2>/dev/null | tr -d '[:space:]')
@@ -278,7 +300,8 @@ while true; do
     fi
     (( show_proj )) && row+=$(printf '%-12s ' "$(clip "${dir##*/}" 12)")
     (( show_title )) && row+=$(printf "%-${title_w}s " "$(clip "$stitle" "$title_w")")
-    (( show_model )) && row+=$(printf '%-18s ' "$(clip "${agent:+$agent/}$modelid" 18)")
+    modelstr="${agent:+$agent/}$modelid"
+    (( show_model )) && row+=$(printf "%-${model_w}s " "$(clip "$modelstr" "$model_w")")
     if (( show_git )); then
       gcell= gcol=$dim
       if [[ -z $dir ]]; then
@@ -384,7 +407,7 @@ while true; do
   header+=$(printf '%-30s ' SESSION)
   (( show_proj )) && header+=$(printf '%-12s ' PROJECT)
   (( show_title )) && header+=$(printf "%-${title_w}s " TITLE)
-  (( show_model )) && header+=$(printf '%-18s ' MODEL)
+  (( show_model )) && header+=$(printf "%-${model_w}s " MODEL)
   (( show_git ))   && header+=$(printf '%-14s ' GIT)
   (( show_pr ))    && header+=$(printf '%-7s ' PR)
   (( show_sub ))   && header+=$(printf '%-4s ' SUB)
