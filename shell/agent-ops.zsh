@@ -185,12 +185,13 @@ _oc_run() {
 }
 
 # znp [path] — add a project shell to the Zellij "Agent Ops" stack.
+# If a pane for that project already exists in this tab, focus it instead.
 znp() {
   if [[ -z ${ZELLIJ:-} ]]; then
     print -u2 "znp: run this inside zellij"
     return 1
   fi
-  local dir name
+  local dir name panes tab id
   if (( $# == 0 )); then
     dir=$HOME
     name=home
@@ -210,7 +211,24 @@ znp() {
     print -u2 "znp: no such directory: $dir"
     return 1
   fi
-  zellij action new-pane --stacked --name "$name" --cwd "$dir"
+  panes=$(zellij action list-panes --json 2>/dev/null)
+  # is_focused is true once per tab, so find our own pane's tab instead.
+  tab=$(print -r -- "$panes" | jq -r --arg cur "${ZELLIJ_PANE_ID:-}" '
+    [.[] | select((.is_plugin | not) and (.id | tostring) == $cur) | .tab_id][0] // empty
+  ')
+  id=$(print -r -- "$panes" | jq -r --arg name "$name" --argjson tab "${tab:-0}" '
+    [.[] | select(.is_plugin == false
+                  and .tab_id == $tab
+                  and (.title == $name or (.title | startswith($name + " - "))))]
+    | .[0].id // empty
+  ')
+  if [[ -n $id ]]; then
+    zellij action focus-pane-id "terminal_$id"
+    return
+  fi
+  # Zellij 0.45 ignores --cwd unless an explicit command is given, so name the
+  # shell rather than relying on the default one.
+  zellij action new-pane --stacked --name "$name" --cwd "$dir" -- "${SHELL:-zsh}"
 }
 
 # zdp [name] — close a pane in the current Zellij tab.
@@ -228,7 +246,9 @@ zdp() {
     print -u2 "zdp: could not list panes"
     return 1
   }
-  tab=$(print -r -- "$panes" | jq -r '.[] | select(.is_focused) | .tab_id' | head -n1)
+  tab=$(print -r -- "$panes" | jq -r --arg cur "${ZELLIJ_PANE_ID:-}" '
+    [.[] | select((.is_plugin | not) and (.id | tostring) == $cur) | .tab_id][0] // empty
+  ')
   id=$(print -r -- "$panes" | jq -r --arg name "$name" --argjson tab "${tab:-0}" '
     [.[] | select(.is_plugin == false and .title == $name and .tab_id == $tab)] | .[0].id // empty
   ')
