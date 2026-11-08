@@ -19,29 +19,28 @@ OpenCode upgrade.
 ## What you get
 
 ```
-┌─────────────────────────────────────────────┐
-│  ⚠2 need you · 1 RUN · $2.83/24h           │   Agent Inbox (21%)
-│  DP ▓▓▓▓░░░░ 53% day  GG ▒▒▒▒▒▒▒▒ ok       │
-│  # STS AGE  SESSION   PROJECT TOKENS COST   │
-│  1 ASK  3m  ses_…     agent-ant  12k  $0.4  │
-│  2 RUN  1m  ses_…     brain     1.2M $1.1  │
-├─────────────────────────────────────────────┤
-│  project shells where OpenCode runs (70%)   │
-├─────────────────────────────────────────────┤
-│  DOCKER · CPU/RAM/DISK/SWAP (sys, 9%)       │
-└─────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────┐
+│  ⚠2 need you · 1 RUN · $2.83/24h · DP ▓▓▓░ 88% day    │   Agent Inbox (21%)
+│  # STS AGE  SESSION   PROJECT TOKENS COST             │
+│  1 ASK  3m  ses_…     agent-ant  12k  $0.4            │
+│  2 RUN  1m  ses_…     brain     1.2M $1.1             │
+├───────────────────────────────────────────────────────┤
+│  project shells where OpenCode runs (70%)             │
+├───────────────────────────────────────────────────────┤
+│  DOCKER · CPU/RAM/DISK/SWAP (sys, 9%)                 │
+└───────────────────────────────────────────────────────┘
 ```
 
 - **`agent-inbox`** — one row per recent session, worst first, with status, age,
   tokens, cost, model, git state, PR/CI state, child-session count, and title.
   Columns drop gracefully as the pane narrows.
-- **`agent-limits`** — subscription meters for the line under the summary. A
-  provider with a usage API (DevPass today) gets a filled bar for the window
+- **`agent-limits`** — subscription meters at the end of the summary line. A
+  provider with a usage API (DevPass today) gets a small bar for the window
   closest to its cap: yellow from 70%, red from 90% with the reset time. A
-  provider without one gets a hatched bar: `ok` until a run on it fails with
+  provider without one just reads `ok` until a run on it fails with
   `provider.quota`, then red `LIMIT 40m ago` until a later run on it succeeds.
-  Hatched `ok` means no limit seen, not confirmed headroom. `agent-limits show`
-  prints every window.
+  `ok` means no limit seen, not confirmed headroom. `agent-limits show` prints
+  every window.
 - **`agent-log` plugin** — subscribes to OpenCode's event stream and appends
   durable lines to a log (the inbox uses this for *why* a run ended). Also fires
   desktop and phone notifications.
@@ -135,7 +134,7 @@ To keep `config` safe for public dotfiles or sharing, secrets live in their own 
 
 ## Limits line
 
-The second line of the Agent Inbox shows subscription meters, written by
+The end of the Agent Inbox's summary line shows subscription meters, written by
 `agent-limits` and read by `agent-inbox` from a cache. Add a provider with a
 usage API as a `fetch_<name>` function in `bin/agent-limits` that writes
 `~/.cache/agent-ops/limits/<name>.json`:

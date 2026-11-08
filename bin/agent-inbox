@@ -45,13 +45,14 @@
 # session totals (the API exposes per-session cost, not per-message). Put a
 # number in AGENT_BUDGET (config) to turn it red once that cap is reached.
 #
-# A limits line sits under the summary, one meter per subscription. A provider
-# with a usage API (DevPass today, via `agent-limits`) shows a bar for the
-# window closest to its cap: green, yellow from 70%, red from 90% with the reset
-# time. A provider with no usage API gets a hatched bar that reads "ok" until a
-# run on it fails with provider.quota, then red "LIMIT <age> ago" until a later
-# run on it succeeds (or 24h pass) — a hatched bar means "no limit seen", not
-# "confirmed available". The inbox starts `agent-limits refresh` in the
+# The summary line ends with one meter per subscription, separated by " · ". A
+# provider with a usage API (DevPass today, via `agent-limits`) shows a small
+# bar for the window closest to its cap: green, yellow from 70%, red from 90%
+# with the reset time. A provider with no usage API just reads "ok" until a run
+# on it fails with provider.quota, then red "LIMIT <age> ago" until a later run
+# on it succeeds (or 24h pass) — "ok" means "no limit seen", not "confirmed
+# available". When the line runs out of room the bars go, then the windows, then
+# the providers that are fine. The inbox starts `agent-limits refresh` in the
 # background once a minute and only reads its cache. Providers to track without
 # a meter go in AGENT_LIMITS_TRACK (config), e.g. "google:GG opencode-go:GO"; a
 # provider that fails with provider.quota is shown even if it is not listed.
@@ -188,23 +189,22 @@ lbar() {
   done
 }
 
-# Build the limits line into limits_line (coloured) and limits_plain (for
-# measuring), and count providers at or over the alert level in limits_hit.
-# mode "narrow" drops the window label and reset time and shortens the bars.
+# Limits meters, rendered inline on the summary line. build_limits collects one
+# segment per subscription into parallel arrays (kind, label, colour, rank and a
+# few numbers); render_limits lays them out for a given width, dropping detail
+# and then whole segments when space is short. rank: 3 = needs action (red),
+# 2 = close to a cap (yellow), 1 = fine. limits_hit counts the rank-3 ones, for
+# the pane title.
 build_limits() {
-  local mode=$1 bw=8
-  [[ $mode == narrow ]] && bw=4
-  limits_line= limits_plain= limits_hit=0
+  limits_hit=0
+  seg_kind=() seg_label=() seg_c=() seg_rank=() seg_pct=() seg_wl=() seg_reset=() seg_state=() seg_age=()
   local -A metered=() want=()
   local -a order=()
 
-  add() {
-    if [[ -n $limits_line ]]; then limits_line+='   '; limits_plain+='   '; fi
-    limits_line+=$1; limits_plain+=$2
-  }
+  add() { seg_kind+=("$1"); seg_label+=("$2"); seg_c+=("$3"); seg_rank+=("$4"); }
 
-  # Providers with a usage API: a real bar for the window closest to its cap.
-  local f name label status updated pct wl wr c plain
+  # Providers with a usage API: the window closest to its cap.
+  local f name label status updated pct wl wr c rank
   shopt -s nullglob
   for f in "$LIMITS_DIR"/*.json; do
     IFS=$'\t' read -r name label status updated pct wl wr < <(jq -r '
@@ -213,24 +213,21 @@ build_limits() {
     [[ -n $name ]] || continue
     metered[$name]=1
     if [[ $status == auth ]]; then
-      add "${yellow}${label} key?${off}" "${label} key?"
+      add auth "$label" "$yellow" 3
       continue
     fi
     (( pct >= 0 )) || continue
-    c=$green
-    (( pct >= LIMIT_WARN )) && c=$yellow
-    if (( pct >= LIMIT_ALERT )); then c=$red; limits_hit=$(( limits_hit + 1 )); fi
+    c=$green rank=1
+    (( pct >= LIMIT_WARN )) && { c=$yellow; rank=2; }
+    if (( pct >= LIMIT_ALERT )); then c=$red rank=3; limits_hit=$(( limits_hit + 1 )); fi
     (( now - updated > STALE )) && c=$dim
-    plain="${label} $(lbar "$pct" "$bw" '▓' '░') ${pct}%"
-    if [[ $mode != narrow ]]; then
-      plain+=" ${wl}"
-      (( pct >= LIMIT_ALERT && wr > now )) && plain+=" ↻$(dur $(( wr - now )))"
-    fi
-    add "${c}${plain}${off}" "$plain"
+    add meter "$label" "$c" "$rank"
+    seg_pct+=("$pct") seg_wl+=("$wl")
+    seg_reset+=("$(( wr > now ? wr - now : 0 ))") seg_state+=("ok") seg_age+=("0")
   done
 
-  # No usage API: a hatched bar. "ok" means no limit has been seen, not that
-  # headroom is confirmed.
+  # No usage API: "ok" means no limit has been seen, not that headroom is
+  # confirmed. No bar — a hatched bar carried no information.
   local pid plabel ts_epoch age
   local -A plabels=()
   local tracked=${AGENT_LIMITS_TRACK:-} item
@@ -251,20 +248,71 @@ build_limits() {
     [[ -n ${metered[$pid]:-} || -n ${want[$pid]:-} ]] && continue
     want[$pid]=1
     plabel=${plabels[$pid]}
+    ts_epoch=0
     if [[ ${lim_state[$pid]:-OK} == FAIL ]]; then
       ts_epoch=$(date -d "${lim_ts[$pid]}" +%s 2>/dev/null || echo 0)
       age=$(( now - ts_epoch ))
-      if (( ts_epoch > 0 && age < LIMIT_HOLD )); then
-        plain="${plabel} $(lbar 100 "$bw" '▒' '▒') LIMIT $(dur "$age")"
-        [[ $mode != narrow ]] && plain+=" ago"
-        add "${bold}${red}${plain}${off}" "$plain"
-        limits_hit=$(( limits_hit + 1 ))
-        continue
-      fi
     fi
-    plain="${plabel} $(lbar 100 "$bw" '▒' '▒') ok"
-    add "${green}${plain}${off}" "$plain"
+    if (( ts_epoch > 0 && age < LIMIT_HOLD )); then
+      add state "$plabel" "$bold$red" 3
+      seg_pct+=(100) seg_wl+=(-) seg_reset+=(0) seg_state+=(FAIL) seg_age+=("$age")
+      limits_hit=$(( limits_hit + 1 ))
+    else
+      add state "$plabel" "$green" 1
+      seg_pct+=(0) seg_wl+=(-) seg_reset+=(0) seg_state+=(OK) seg_age+=(0)
+    fi
   done
+}
+
+# render_limits <wide|narrow> <min-rank> <avail>
+#   wide:   DP ▓▓▓░ 85% day ↻2h     narrow: DP 85%     (no bar, no window)
+# Stops before adding a segment that would not fit, so the line never wraps.
+# Bar cells and ↻ are multi-byte, so width is measured on `pm`, an ASCII twin.
+render_limits() {
+  local mode=$1 min_rank=$2 avail=$3 i p pm n=0 space r
+  limits_line= limits_plain= limits_elig=0
+  local -a idx=()
+  if (( min_rank > 0 )); then   # cramped: most urgent first, so it is not the one cut
+    for r in 3 2 1; do
+      for i in "${!seg_kind[@]}"; do (( seg_rank[i] == r )) && idx+=("$i"); done
+    done
+  else
+    idx=("${!seg_kind[@]}")
+  fi
+  for i in "${idx[@]}"; do
+    (( seg_rank[i] >= min_rank )) || continue
+    limits_elig=$(( limits_elig + 1 ))
+    case ${seg_kind[i]} in
+      meter)
+        p=${seg_label[i]} pm=${seg_label[i]}
+        if [[ $mode == wide ]]; then
+          p+=" $(lbar "${seg_pct[i]}" 4 '▓' '░')"; pm+=" xxxx"
+        fi
+        p+=" ${seg_pct[i]}%"; pm+=" ${seg_pct[i]}%"
+        if [[ $mode == wide ]]; then
+          if [[ ${seg_wl[i]} != - ]]; then p+=" ${seg_wl[i]}"; pm+=" ${seg_wl[i]}"; fi
+          if (( seg_rank[i] == 3 && seg_reset[i] > 0 )); then
+            p+=" ↻$(dur "${seg_reset[i]}")"; pm+=" ~$(dur "${seg_reset[i]}")"
+          fi
+        fi ;;
+      auth)
+        p="${seg_label[i]} key?"; pm=$p ;;
+      state)
+        if [[ ${seg_state[i]} == FAIL ]]; then
+          p="${seg_label[i]} LIMIT $(dur "${seg_age[i]}")"
+          [[ $mode == wide ]] && p+=" ago"
+        else
+          p="${seg_label[i]} ok"
+        fi
+        pm=$p ;;
+    esac
+    space=$(( n > 0 ? 3 : 0 ))   # " · "
+    (( ${#limits_plain} + space + ${#pm} <= avail )) || break
+    if (( n > 0 )); then limits_line+=' · '; limits_plain+=' · '; fi
+    limits_line+="${seg_c[i]}${p}${off}"; limits_plain+=$pm
+    n=$(( n + 1 ))
+  done
+  limits_n=$n
 }
 
 # Drop-ladder state. COL_W[n] is the rendered width with the first n optional
@@ -565,21 +613,30 @@ while true; do
   if [[ -n $budget && $budget =~ ^[0-9]+([.][0-9]+)?$ ]]; then
     awk -v a="$spend" -v b="$budget" 'BEGIN { exit !(a >= b) }' && over=1
   fi
-  summary=
-  (( urgent > 0 )) && summary+="${red}⚠${urgent} need you${off}"
-  [[ -n $summary ]] && summary+=" · "
-  summary+="${green}${running} RUN${off}"
+  summary= summary_plain=
+  if (( urgent > 0 )); then
+    summary+="${red}⚠${urgent} need you${off} · "
+    summary_plain+="⚠${urgent} need you · "
+  fi
+  summary+="${green}${running} RUN${off}"; summary_plain+="${running} RUN"
   if [[ $spends != - ]]; then
     summary+=" · "
     (( over )) && summary+="$red"
     summary+="${spends}/24h"
     (( over )) && summary+="$off"
+    summary_plain+=" · ${spends}/24h"
   fi
 
-  build_limits wide
-  if (( ${#limits_plain} > cols )); then build_limits narrow; fi
-  top=$summary lim_rows=0
-  if [[ -n $limits_line ]]; then top+=$'\n'"$limits_line"; lim_rows=1; fi
+  # The meters share this line; give them whatever room is left, shrinking
+  # them (no bar, no window) and then dropping ok providers as it runs out.
+  avail=$(( cols - ${#summary_plain} - 3 ))
+  build_limits
+  render_limits wide 0 "$avail"
+  (( limits_n < limits_elig )) && render_limits narrow 0 "$avail"
+  (( limits_n < limits_elig )) && render_limits narrow 2 "$avail"
+  (( limits_n < limits_elig )) && render_limits narrow 3 "$avail"
+  if [[ -n $limits_line ]]; then summary+=' · '"$limits_line"; fi
+  top=$summary
 
   header=$(printf '%s%-3s%-4s %-6s ' "$bold" '#' STS AGE)
   header+=$(printf '%-30s ' SESSION)
@@ -596,7 +653,7 @@ while true; do
 
   if [[ -n $rows ]]; then
     lines=$(tput lines 2>/dev/null || echo 40)
-    max_rows=$(( lines - 3 - lim_rows )); (( max_rows < 5 )) && max_rows=5
+    max_rows=$(( lines - 3 )); (( max_rows < 5 )) && max_rows=5
     sorted=$(printf '%s' "$rows" | sort -n -k1,1 | head -n "$max_rows")
     body= n=0 listed=
     while IFS=$'\t' read -r _ sid line; do

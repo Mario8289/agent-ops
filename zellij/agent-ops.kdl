@@ -3,13 +3,12 @@
 //
 // One column, tuned for a tall narrow window (~78 cols x 65 rows, e.g. 30% of a
 // screen):
-//   top    (21%): Agent Inbox — a summary line, a subscription-limits line
-//                 (agent-limits), then one row per recent session, worst first,
-//                 with its status, age, and total tokens / cost so far. Retitles
-//                 itself "Agent
-//                 Inbox ⚠N" when N sessions need you. Needs the agent-log
-//                 plugin (writes the log) and agent-inbox (reads the OpenCode
-//                 server API).
+//   top    (21%): Agent Inbox — a summary line that ends with the subscription
+//                 limit meters (agent-limits), then one row per recent session,
+//                 worst first, with its status, age, and total tokens / cost so
+//                 far. Retitles itself "Agent Inbox ⚠N" when N sessions need
+//                 you. Needs the agent-log plugin (writes the log) and
+//                 agent-inbox (reads the OpenCode server API).
 //   middle (70%): project shells where OpenCode runs, stacked — switch with
 //                 Alt+Up/Down or click a collapsed title. Add one at runtime
 //                 with `znp pcode/agent-ant` (no argument = home); remove with
