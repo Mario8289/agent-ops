@@ -238,6 +238,7 @@ build_limits() {
     done < "$LIMITS_PROVIDERS"
   fi
   for pid in "${!lim_state[@]}"; do
+    [[ ${lim_state[$pid]} == FAIL ]] || continue
     [[ -n ${plabels[$pid]:-} ]] || { order+=("$pid"); plabels[$pid]=$(short_label "$pid"); }
   done
   for pid in "${order[@]}"; do
