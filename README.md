@@ -87,12 +87,8 @@ After `install.sh` and `configure`:
 2. **Subscription limits** (optional, see [Limits line](#limits-line)):
    - DevPass: make `DEVPASS_API_KEY` visible to the process that starts Zellij,
      or put the key in `~/.config/agent-ops/devpass-key` (`chmod 600`).
-   - Google, OpenCode Go and others without a usage API: list them in
-     `~/.config/agent-ops/limits-providers`, one `providerID LABEL` per line:
-     ```
-     google GG
-     opencode-go GO
-     ```
+   - Google, OpenCode Go and others without a usage API: configured via
+     `./configure` or `AGENT_LIMITS_TRACK="google:GG opencode-go:GO"` in `~/.config/agent-ops/config`.
      Provider IDs are the ones OpenCode uses; list them with
      `opencode api provider.list | jq -r '.. | .id? // empty'` or look at the
      `model.providerID` of `opencode api session.list`.
@@ -108,35 +104,31 @@ After `install.sh` and `configure`:
 
 ## Configuration
 
-`~/.config/agent-ops/config` (written by `configure`, sourced by the scripts):
+All non-secret configuration lives in a single file: `~/.config/agent-ops/config`.
+It is plain shell syntax, written by `./configure` and sourced by the scripts:
 
-| Variable | Meaning |
-|---|---|
-| `AGENT_SOURCE` | session source: `opencode` today, `pi` is a planned second |
-| `AGENT_LOG` | where the plugin writes events (default `~/agent-runs/agent_health.log`) |
-| `AGENT_SESSION_LIST` | the row→ID cache the inbox writes for `sd`/`so` |
-| `AGENT_BUDGET_FILE` | path to the optional daily budget file |
-| `AGENT_LIMIT_WARN` | limits line turns yellow at this percent (default `70`) |
-| `AGENT_LIMIT_ALERT` | limits line turns red at this percent (default `90`) |
-| `AGENT_LIMITS_PROVIDERS` | path to the `limits-providers` file |
-| `AGENT_LIMITS_DIR` | where `agent-limits` caches (default `~/.cache/agent-ops/limits`) |
-| `DEVPASS_BASE_URL` | DevPass API base (default `https://api.llmgateway.io/v1`) |
+```sh
+# ~/.config/agent-ops/config
+AGENT_SOURCE=opencode
+AGENT_LOG="$HOME/agent-runs/agent_health.log"
+AGENT_SESSION_LIST="$HOME/.cache/opencode-session-list"
+AGENT_BUDGET=25                             # optional daily spend cap ($)
+AGENT_LIMITS_TRACK="google:GG opencode-go:GO" # providers to show hatched bars for
 
-`config` is plain shell, sourced by `agent-inbox`, `agent-limits` and the shell
-helpers, so any variable in this table can be set there. Keep secrets out of it:
-the ntfy topic and the DevPass key live in their own `chmod 600` files below.
+# Tunables (all optional, showing defaults):
+#AGENT_LIMIT_WARN=70        # yellow bar threshold (%)
+#AGENT_LIMIT_ALERT=90       # red bar threshold (%)
+#AGENT_LIMIT_HOLD=86400     # seconds a quota failure is remembered without a later success
+#AGENT_LIMITS_REFRESH=60    # seconds between background agent-limits refreshes
+#AGENT_LIMIT_STALE=300      # seconds before a cached limit is shown dimmed
+```
 
-Optional files:
+### Secrets (chmod 600, kept separate)
 
-- `~/.config/agent-ops/ntfy-topic` — the phone-push topic (chmod 600, not in git).
-  Its existence is the on/off switch: no file, no phone push.
-- `~/.config/agent-ops/budget` — a dollar amount; the summary's spend turns red
-  once it's reached.
-- `~/.config/agent-ops/devpass-key` — the DevPass gateway key (chmod 600, not in
-  git), for when the pane does not inherit `$DEVPASS_API_KEY` from your shell.
-- `~/.config/agent-ops/limits-providers` — providers to track with a hatched bar,
-  one `providerID LABEL` per line (e.g. `google GG`, `opencode-go GO`). A
-  provider that hits `provider.quota` is shown even if it is not listed.
+To keep `config` safe for public dotfiles or sharing, secrets live in their own files:
+
+- `~/.config/agent-ops/ntfy-topic` — the random phone-push topic for ntfy.sh (chmod 600).
+- `~/.config/agent-ops/devpass-key` — the DevPass gateway API key (chmod 600), only needed if `$DEVPASS_API_KEY` is not exported in your shell/Zellij environment.
 
 ## Limits line
 

@@ -2,9 +2,9 @@
 # configure — interactive setup for agent-ops.
 #
 # Writes:
-#   ~/.config/agent-ops/config       paths + source (sourced by the scripts)
+#   ~/.config/agent-ops/config       every setting (sourced by the scripts)
 #   ~/.config/agent-ops/ntfy-topic   phone-push secret (optional, chmod 600)
-#   ~/.config/agent-ops/budget       daily spend cap (optional)
+# Secrets (ntfy-topic, devpass-key) stay in their own chmod 600 files.
 #   ~/.config/zellij/layouts/agent-ops.kdl   a layout for your projects
 # Idempotent: re-run to change answers.
 set -euo pipefail
@@ -14,12 +14,19 @@ CFG_DIR="$HOME/.config/agent-ops"
 CFG="$CFG_DIR/config"
 mkdir -p "$CFG_DIR"
 
+# Existing answers become the defaults, so re-running is safe.
+if [[ -r $CFG ]]; then
+  # shellcheck disable=SC1090
+  source "$CFG"
+fi
+
 say()  { printf '%s\n' "$*"; }
-ask()  { # ask <prompt> <default>  ->  prints the answer
+ask()  { # ask <prompt> <default>  ->  prints the answer ("-" answers blank)
   local prompt=$1 default=${2:-} ans
-  printf '%s [%s]: ' "$prompt" "$default"
+  printf '%s [%s]: ' "$prompt" "$default" >&2
   IFS= read -r ans
   [[ -z $ans ]] && ans=$default
+  [[ $ans == - ]] && ans=          # "-" clears a value that has a default
   printf '%s' "$ans"
 }
 yesno() { # yesno <prompt> [y|n]  ->  0 for yes, 1 for no
@@ -50,9 +57,8 @@ fi
 say
 
 # --- paths (defaults are fine for most) ---
-log_path=$(ask "Log file" "$HOME/agent-runs/agent_health.log")
-cache_path=$(ask "Session-list cache" "${XDG_CACHE_HOME:-$HOME/.cache}/opencode-session-list")
-budget_file="$CFG_DIR/budget"
+log_path=$(ask "Log file" "${AGENT_LOG:-$HOME/agent-runs/agent_health.log}")
+cache_path=$(ask "Session-list cache" "${AGENT_SESSION_LIST:-${XDG_CACHE_HOME:-$HOME/.cache}/opencode-session-list}")
 
 # --- session source (adapter seam) ---
 source_name="opencode"
@@ -68,7 +74,23 @@ if command -v curl >/dev/null 2>&1 && yesno "Phone notifications via ntfy.sh?" n
 fi
 
 # --- budget ---
-budget=$(ask "Daily budget cap in dollars (blank = none)" "")
+old_budget=${AGENT_BUDGET:-}
+if [[ -z $old_budget && -r $CFG_DIR/budget ]]; then
+  old_budget=$(head -n1 "$CFG_DIR/budget" | tr -d '[:space:]')
+fi
+budget=$(ask "Daily budget cap in dollars (blank = none)" "$old_budget")
+
+# --- subscription limits ---
+old_track=${AGENT_LIMITS_TRACK:-}
+if [[ -z $old_track && -r $CFG_DIR/limits-providers ]]; then
+  old_track=$(sed -e '/^[[:space:]]*#/d' -e 's/[[:space:]]\+/:/' "$CFG_DIR/limits-providers" | tr '\n' ' ')
+  old_track=${old_track% }
+fi
+say
+say "Limits line: providers with no usage API get a hatched bar that goes red on a quota error."
+say "  format: providerID:LABEL, space-separated (e.g. google:GG opencode-go:GO)"
+say "  DevPass is metered automatically if \$DEVPASS_API_KEY or $CFG_DIR/devpass-key is set."
+track=$(ask "Providers to track" "$old_track")
 
 # --- write config ---
 umask 077
@@ -77,7 +99,16 @@ cat > "$CFG" <<EOF
 AGENT_SOURCE=$source_name
 AGENT_LOG="$log_path"
 AGENT_SESSION_LIST="$cache_path"
-AGENT_BUDGET_FILE="$budget_file"
+EOF
+[[ -n $budget ]] && printf 'AGENT_BUDGET=%s\n' "$budget" >> "$CFG"
+[[ -n $track ]]  && printf 'AGENT_LIMITS_TRACK="%s"\n' "$track" >> "$CFG"
+# Tunables, left at their defaults. Uncomment to change.
+cat >> "$CFG" <<'EOF'
+#AGENT_LIMIT_WARN=70        # limits line turns yellow at this percent
+#AGENT_LIMIT_ALERT=90       # ... and red at this one
+#AGENT_LIMIT_HOLD=86400     # seconds a quota failure is trusted without a later success
+#AGENT_LIMITS_REFRESH=60    # seconds between background fetches
+#AGENT_LIMIT_STALE=300      # seconds before a meter is shown dimmed
 EOF
 say
 say "wrote $CFG"
@@ -95,13 +126,13 @@ if (( phone )); then
   say "  (server: ntfy.sh; the topic file is $topic_file, chmod 600)"
 fi
 
-# --- budget file ---
-if [[ -n $budget ]]; then
-  printf '%s\n' "$budget" > "$budget_file"
-  say "wrote $budget_file ($budget)"
-else
-  rm -f "$budget_file"
-fi
+# --- fold the older one-value files into config ---
+for old in budget limits-providers; do
+  if [[ -e $CFG_DIR/$old ]]; then
+    rm -f "$CFG_DIR/$old"
+    say "folded $CFG_DIR/$old into config"
+  fi
+done
 
 # --- zellij layout ---
 if yesno "Generate a Zellij layout with your project directories?" y; then

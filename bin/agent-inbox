@@ -43,7 +43,7 @@
 # A summary line sits above the table: "⚠N need you · M RUN · $X/24h". The
 # dollar figure is rolling-24h spend across all sessions, approximated from
 # session totals (the API exposes per-session cost, not per-message). Put a
-# number in ~/.config/agent-ops/budget to turn it red once that cap is reached.
+# number in AGENT_BUDGET (config) to turn it red once that cap is reached.
 #
 # A limits line sits under the summary, one meter per subscription. A provider
 # with a usage API (DevPass today, via `agent-limits`) shows a bar for the
@@ -53,9 +53,10 @@
 # run on it succeeds (or 24h pass) — a hatched bar means "no limit seen", not
 # "confirmed available". The inbox starts `agent-limits refresh` in the
 # background once a minute and only reads its cache. Providers to track without
-# a meter go in ~/.config/agent-ops/limits-providers, one "providerID LABEL"
-# per line (e.g. "google GG"); a provider that fails with provider.quota is
-# shown even if it is not listed. Thresholds: AGENT_LIMIT_WARN / AGENT_LIMIT_ALERT.
+# a meter go in AGENT_LIMITS_TRACK (config), e.g. "google:GG opencode-go:GO"; a
+# provider that fails with provider.quota is shown even if it is not listed.
+# Tunables (all optional, set in ~/.config/agent-ops/config): AGENT_LIMIT_WARN,
+# AGENT_LIMIT_ALERT, AGENT_LIMIT_HOLD, AGENT_LIMITS_REFRESH, AGENT_LIMIT_STALE.
 #
 # The # column numbers the rows as shown. The IDs are saved in that order to
 # $SESSION_LIST (default ~/.cache/opencode-session-list), so `sd 3` deletes row
@@ -113,7 +114,8 @@ PROVIDERS_JQ='.data[] | select((.model.providerID // "") != "") | [ .id, .model.
 source_providers() { printf '%s' "$_raw" | jq -r "$PROVIDERS_JQ" 2>/dev/null; }
 
 # Optional daily budget in dollars. When set and the 24h spend reaches it, the
-# summary line's spend turns red. One line, e.g. "4.64"; absent = no threshold.
+# summary line's spend turns red. AGENT_BUDGET in the config (e.g. 4.64); the
+# older one-line budget file still works. Absent = no threshold.
 BUDGET_FILE="${AGENT_BUDGET_FILE:-$HOME/.config/agent-ops/budget}"
 
 if [[ -t 1 ]]; then
@@ -146,9 +148,9 @@ LIMITS_DIR="${AGENT_LIMITS_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/agent-ops/limits
 LIMITS_PROVIDERS="${AGENT_LIMITS_PROVIDERS:-$HOME/.config/agent-ops/limits-providers}"
 LIMIT_WARN=${AGENT_LIMIT_WARN:-70}
 LIMIT_ALERT=${AGENT_LIMIT_ALERT:-90}
-LIMIT_HOLD=86400      # a quota failure with no later success is trusted this long
-LIMITS_REFRESH=60     # seconds between background `agent-limits refresh`
-STALE=300             # a meter this old is shown dimmed
+LIMIT_HOLD=${AGENT_LIMIT_HOLD:-86400}      # a quota failure with no later success is trusted this long
+LIMITS_REFRESH=${AGENT_LIMITS_REFRESH:-60} # seconds between background `agent-limits refresh`
+STALE=${AGENT_LIMIT_STALE:-300}            # a meter this old is shown dimmed
 LIMITS_BIN="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/agent-limits"
 [[ -x $LIMITS_BIN ]] || LIMITS_BIN=$(command -v agent-limits 2>/dev/null || true)
 last_refresh=0
@@ -231,12 +233,16 @@ build_limits() {
   # headroom is confirmed.
   local pid plabel ts_epoch age
   local -A plabels=()
-  if [[ -r $LIMITS_PROVIDERS ]]; then
-    while read -r pid plabel _; do
-      [[ -z $pid || $pid == \#* ]] && continue
-      order+=("$pid"); plabels[$pid]=${plabel:-$(short_label "$pid")}
-    done < "$LIMITS_PROVIDERS"
+  local tracked=${AGENT_LIMITS_TRACK:-} item
+  if [[ -z $tracked && -r $LIMITS_PROVIDERS ]]; then   # older "providerID LABEL" file
+    tracked=$(sed -e '/^[[:space:]]*#/d' -e 's/[[:space:]]\+/:/' "$LIMITS_PROVIDERS" | tr '\n' ' ')
   fi
+  for item in $tracked; do
+    pid=${item%%:*} plabel=
+    [[ $item == *:* ]] && plabel=${item#*:}
+    [[ -n $pid ]] || continue
+    order+=("$pid"); plabels[$pid]=${plabel:-$(short_label "$pid")}
+  done
   for pid in "${!lim_state[@]}"; do
     [[ ${lim_state[$pid]} == FAIL ]] || continue
     [[ -n ${plabels[$pid]:-} ]] || { order+=("$pid"); plabels[$pid]=$(short_label "$pid"); }
@@ -365,8 +371,8 @@ while true; do
     spacer=$(( cols - width )); (( spacer < 0 )) && spacer=0
   fi
 
-  budget=
-  [[ -r $BUDGET_FILE ]] && budget=$(head -n1 "$BUDGET_FILE" 2>/dev/null | tr -d '[:space:]')
+  budget=${AGENT_BUDGET:-}
+  [[ -z $budget && -r $BUDGET_FILE ]] && budget=$(head -n1 "$BUDGET_FILE" 2>/dev/null | tr -d '[:space:]')
 
   # Which session is in the pane that has focus right now? `so`/`sc`/`sn` put the ID in
   # the pane title; anything else (a plain shell, this pane) yields nothing.
