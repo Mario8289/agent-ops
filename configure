@@ -145,10 +145,10 @@ layout {
 
     tab name="Agent Ops" {
         pane split_direction="horizontal" {
-            pane name="Agent Inbox" command="agent-inbox" size="20%"
+            pane name="Agent Inbox" command="agent-inbox" size="21%"
             pane stacked=true size="70%" {
 $panes            }
-            pane name="System" command="sys" size="10%"
+            pane name="System" command="sys" size="9%"
         }
     }
 }

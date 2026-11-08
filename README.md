@@ -20,20 +20,28 @@ OpenCode upgrade.
 
 ```
 ┌─────────────────────────────────────────────┐
-│  ⚠2 need you · 1 RUN · $2.83/24h           │   Agent Inbox (20%)
+│  ⚠2 need you · 1 RUN · $2.83/24h           │   Agent Inbox (21%)
+│  DP ▓▓▓▓░░░░ 53% day  GG ▒▒▒▒▒▒▒▒ ok       │
 │  # STS AGE  SESSION   PROJECT TOKENS COST   │
 │  1 ASK  3m  ses_…     agent-ant  12k  $0.4  │
 │  2 RUN  1m  ses_…     brain     1.2M $1.1  │
 ├─────────────────────────────────────────────┤
 │  project shells where OpenCode runs (70%)   │
 ├─────────────────────────────────────────────┤
-│  DOCKER · CPU/RAM/DISK/SWAP (sys, 10%)      │
+│  DOCKER · CPU/RAM/DISK/SWAP (sys, 9%)       │
 └─────────────────────────────────────────────┘
 ```
 
 - **`agent-inbox`** — one row per recent session, worst first, with status, age,
   tokens, cost, model, git state, PR/CI state, child-session count, and title.
   Columns drop gracefully as the pane narrows.
+- **`agent-limits`** — subscription meters for the line under the summary. A
+  provider with a usage API (DevPass today) gets a filled bar for the window
+  closest to its cap: yellow from 70%, red from 90% with the reset time. A
+  provider without one gets a hatched bar: `ok` until a run on it fails with
+  `provider.quota`, then red `LIMIT 40m ago` until a later run on it succeeds.
+  Hatched `ok` means no limit seen, not confirmed headroom. `agent-limits show`
+  prints every window.
 - **`agent-log` plugin** — subscribes to OpenCode's event stream and appends
   durable lines to a log (the inbox uses this for *why* a run ended). Also fires
   desktop and phone notifications.
@@ -101,6 +109,11 @@ Optional files:
   Its existence is the on/off switch: no file, no phone push.
 - `~/.config/agent-ops/budget` — a dollar amount; the summary's spend turns red
   once it's reached.
+- `~/.config/agent-ops/devpass-key` — the DevPass gateway key (chmod 600, not in
+  git), for when the pane does not inherit `$DEVPASS_API_KEY` from your shell.
+- `~/.config/agent-ops/limits-providers` — providers to track with a hatched bar,
+  one `providerID LABEL` per line (e.g. `google GG`, `opencode-go GO`). A
+  provider that hits `provider.quota` is shown even if it is not listed.
 
 ## The adapter seam
 

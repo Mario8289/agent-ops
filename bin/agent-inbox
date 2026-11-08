@@ -18,8 +18,8 @@
 # ADAPTER SEAM — `source_sessions` emits one tab-separated record per session:
 #   id  upd  busy  dir  title  tot  cost  kids  busykids  agent  model
 # (upd is epoch seconds). Backed by OpenCode today; a different harness (e.g.
-# pi.dev) only has to reimplement `source_fetch`, `source_sessions` and
-# `source_spend`.
+# pi.dev) only has to reimplement `source_fetch`, `source_sessions`,
+# `source_spend` and `source_providers` (id and provider ID per session).
 #
 # TOKENS is the running total for the whole session (input + output + cache read
 # + cache write). COST is the provider's reported dollar figure. MODEL is the
@@ -45,6 +45,18 @@
 # session totals (the API exposes per-session cost, not per-message). Put a
 # number in ~/.config/agent-ops/budget to turn it red once that cap is reached.
 #
+# A limits line sits under the summary, one meter per subscription. A provider
+# with a usage API (DevPass today, via `agent-limits`) shows a bar for the
+# window closest to its cap: green, yellow from 70%, red from 90% with the reset
+# time. A provider with no usage API gets a hatched bar that reads "ok" until a
+# run on it fails with provider.quota, then red "LIMIT <age> ago" until a later
+# run on it succeeds (or 24h pass) — a hatched bar means "no limit seen", not
+# "confirmed available". The inbox starts `agent-limits refresh` in the
+# background once a minute and only reads its cache. Providers to track without
+# a meter go in ~/.config/agent-ops/limits-providers, one "providerID LABEL"
+# per line (e.g. "google GG"); a provider that fails with provider.quota is
+# shown even if it is not listed. Thresholds: AGENT_LIMIT_WARN / AGENT_LIMIT_ALERT.
+#
 # The # column numbers the rows as shown. The IDs are saved in that order to
 # $SESSION_LIST (default ~/.cache/opencode-session-list), so `sd 3` deletes row
 # 3. Rows re-sort when agent states change: check the number just before you
@@ -66,7 +78,7 @@ mkdir -p "$(dirname "$SESSION_LIST")"
 
 # ---- adapter seam ----
 # Emits one tab-separated record per session (see header). Today it reads the
-# OpenCode server API; a different harness only has to reimplement these three.
+# OpenCode server API; a different harness only has to reimplement these four.
 ROWS_JQ='.data as $all
   | ($all | map(select((.parentID // null) != null))) as $children
   | $all | map(select((.parentID // null) == null))
@@ -94,6 +106,11 @@ _raw=
 source_fetch()    { _raw=$(opencode api session.list 2>/dev/null); }
 source_sessions() { printf '%s' "$_raw" | jq -r "$ROWS_JQ" 2>/dev/null; }
 source_spend()    { printf '%s' "$_raw" | jq -r "$SPEND_JQ" 2>/dev/null; }
+
+# "session-id<TAB>provider" for every session (not just the shown rows), so a
+# quota failure is pinned on the right provider even for an older session.
+PROVIDERS_JQ='.data[] | select((.model.providerID // "") != "") | [ .id, .model.providerID ] | @tsv'
+source_providers() { printf '%s' "$_raw" | jq -r "$PROVIDERS_JQ" 2>/dev/null; }
 
 # Optional daily budget in dollars. When set and the 24h spend reaches it, the
 # summary line's spend turns red. One line, e.g. "4.64"; absent = no threshold.
@@ -123,6 +140,125 @@ clip() {
 
 prev=
 prev_title=
+
+# ---- limits line ----
+LIMITS_DIR="${AGENT_LIMITS_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/agent-ops/limits}"
+LIMITS_PROVIDERS="${AGENT_LIMITS_PROVIDERS:-$HOME/.config/agent-ops/limits-providers}"
+LIMIT_WARN=${AGENT_LIMIT_WARN:-70}
+LIMIT_ALERT=${AGENT_LIMIT_ALERT:-90}
+LIMIT_HOLD=86400      # a quota failure with no later success is trusted this long
+LIMITS_REFRESH=60     # seconds between background `agent-limits refresh`
+STALE=300             # a meter this old is shown dimmed
+LIMITS_BIN="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/agent-limits"
+[[ -x $LIMITS_BIN ]] || LIMITS_BIN=$(command -v agent-limits 2>/dev/null || true)
+last_refresh=0
+
+# Provider ID -> two-letter label for providers we do not meter.
+short_label() {
+  case $1 in
+    google|google-vertex) printf 'GG' ;;
+    opencode-go)          printf 'GO' ;;
+    opencode)             printf 'OC' ;;
+    anthropic)            printf 'CC' ;;
+    openai)               printf 'OA' ;;
+    devpass)              printf 'DP' ;;
+    *) local u=${1^^}; printf '%s' "${u:0:2}" ;;
+  esac
+}
+
+# 3700 -> 1h1m, 540 -> 9m, 200000 -> 2d
+dur() {
+  local s=${1:-0}
+  (( s < 0 )) && s=0
+  if (( s < 3600 )); then printf '%dm' $(( s / 60 ))
+  elif (( s < 86400 )); then printf '%dh%dm' $(( s / 3600 )) $(( s % 3600 / 60 ))
+  else printf '%dd' $(( s / 86400 )); fi
+}
+
+# lbar <pct> <width> <fill> <empty>
+lbar() {
+  local pct=${1:-0} w=${2:-8} f=$3 e=$4 i filled
+  (( pct < 0 )) && pct=0
+  (( pct > 100 )) && pct=100
+  filled=$(( pct * w / 100 ))
+  for ((i = 0; i < w; i++)); do
+    if (( i < filled )); then printf '%s' "$f"; else printf '%s' "$e"; fi
+  done
+}
+
+# Build the limits line into limits_line (coloured) and limits_plain (for
+# measuring), and count providers at or over the alert level in limits_hit.
+# mode "narrow" drops the window label and reset time and shortens the bars.
+build_limits() {
+  local mode=$1 bw=8
+  [[ $mode == narrow ]] && bw=4
+  limits_line= limits_plain= limits_hit=0
+  local -A metered=() want=()
+  local -a order=()
+
+  add() {
+    if [[ -n $limits_line ]]; then limits_line+='   '; limits_plain+='   '; fi
+    limits_line+=$1; limits_plain+=$2
+  }
+
+  # Providers with a usage API: a real bar for the window closest to its cap.
+  local f name label status updated pct wl wr c plain
+  shopt -s nullglob
+  for f in "$LIMITS_DIR"/*.json; do
+    IFS=$'\t' read -r name label status updated pct wl wr < <(jq -r '
+      (.windows | max_by(.pct)) as $w
+      | [ .name, .label, .status, .updated, ($w.pct // -1), ($w.label // "-"), ($w.resets // 0) ] | @tsv' "$f" 2>/dev/null) || continue
+    [[ -n $name ]] || continue
+    metered[$name]=1
+    if [[ $status == auth ]]; then
+      add "${yellow}${label} key?${off}" "${label} key?"
+      continue
+    fi
+    (( pct >= 0 )) || continue
+    c=$green
+    (( pct >= LIMIT_WARN )) && c=$yellow
+    if (( pct >= LIMIT_ALERT )); then c=$red; limits_hit=$(( limits_hit + 1 )); fi
+    (( now - updated > STALE )) && c=$dim
+    plain="${label} $(lbar "$pct" "$bw" '▓' '░') ${pct}%"
+    if [[ $mode != narrow ]]; then
+      plain+=" ${wl}"
+      (( pct >= LIMIT_ALERT && wr > now )) && plain+=" ↻$(dur $(( wr - now )))"
+    fi
+    add "${c}${plain}${off}" "$plain"
+  done
+
+  # No usage API: a hatched bar. "ok" means no limit has been seen, not that
+  # headroom is confirmed.
+  local pid plabel ts_epoch age
+  local -A plabels=()
+  if [[ -r $LIMITS_PROVIDERS ]]; then
+    while read -r pid plabel _; do
+      [[ -z $pid || $pid == \#* ]] && continue
+      order+=("$pid"); plabels[$pid]=${plabel:-$(short_label "$pid")}
+    done < "$LIMITS_PROVIDERS"
+  fi
+  for pid in "${!lim_state[@]}"; do
+    [[ -n ${plabels[$pid]:-} ]] || { order+=("$pid"); plabels[$pid]=$(short_label "$pid"); }
+  done
+  for pid in "${order[@]}"; do
+    [[ -n ${metered[$pid]:-} || -n ${want[$pid]:-} ]] && continue
+    want[$pid]=1
+    plabel=${plabels[$pid]}
+    if [[ ${lim_state[$pid]:-OK} == FAIL ]]; then
+      ts_epoch=$(date -d "${lim_ts[$pid]}" +%s 2>/dev/null || echo 0)
+      age=$(( now - ts_epoch ))
+      if (( ts_epoch > 0 && age < LIMIT_HOLD )); then
+        plain="${plabel} $(lbar 100 "$bw" '▒' '▒') LIMIT $(dur "$age")"
+        [[ $mode != narrow ]] && plain+=" ago"
+        add "${bold}${red}${plain}${off}" "$plain"
+        limits_hit=$(( limits_hit + 1 ))
+        continue
+      fi
+    fi
+    plain="${plabel} $(lbar 100 "$bw" '▒' '▒') ok"
+    add "${green}${plain}${off}" "$plain"
+  done
+}
 
 # Drop-ladder state. COL_W[n] is the rendered width with the first n optional
 # columns shown, in reveal order: PROJECT, COST, TITLE, MODEL, GIT, PR, SUB
@@ -192,6 +328,12 @@ while true; do
   spend=$(source_spend)
   [[ $spend =~ ^-?[0-9] ]] || spend=0
 
+  if [[ -n $LIMITS_BIN ]] && (( now - last_refresh >= LIMITS_REFRESH )); then
+    last_refresh=$now
+    "$LIMITS_BIN" refresh >/dev/null 2>&1 &
+    disown 2>/dev/null
+  fi
+
   # Flex the leftover width across the content columns instead of dumping it all
   # into TITLE. TITLE grows first, but only until the longest title fits; then
   # MODEL grows until the longest agent/model fits. Whatever is left becomes a
@@ -235,27 +377,46 @@ while true; do
   fi
 
   unset ev; declare -A ev=()
+  unset lim_state lim_ts prov_of; declare -A lim_state=() lim_ts=() prov_of=()
+  while IFS=$'\t' read -r _sid _p; do [[ -n $_sid ]] && prov_of[$_sid]=$_p; done < <(source_providers)
   if [[ -r $LOG && -n $data ]]; then
-    unset ltag ltext; declare -a ltag=() ltext=()
+    unset ltag ltext lts; declare -a ltag=() ltext=() lts=()
     while IFS= read -r line; do
       tag=${line#*] [}                 # "ses_e539 brain] FAILED provider.quota: ..."
       [[ $tag == *'] '* ]] || continue
       text=${tag#*] }                  # "FAILED provider.quota: ..."
       case ${text%% *} in
         WAITING|RESUMED|IDLE|INTERRUPTED|RETRY|FAILED|LOADED)
-          ltag+=("${tag%% *}"); ltext+=("$text") ;;
+          ltag+=("${tag%% *}"); ltext+=("$text"); lts+=("${line:1:19}") ;;
       esac
     done < <(tail -n 400 "$LOG" 2>/dev/null)
 
     unset ids; declare -a ids=()
     while IFS=$'\t' read -r id _; do [[ -n $id ]] && ids+=("$id"); done <<< "$data"
 
+    # Log lines are in time order, so the last quota failure or success seen
+    # for a provider decides its state. The log tag is an id prefix, so look
+    # the full id up among all sessions, not just the rows shown.
     for i in "${!ltag[@]}"; do
       t=${ltag[i]} hits=0 hit=
       for id in "${ids[@]}"; do
         if [[ $id == "$t"* ]]; then hits=$(( hits + 1 )); hit=$id; fi
       done
       (( hits == 1 )) && ev[$hit]=${ltext[i]}
+      case ${ltext[i]} in
+        "FAILED provider.quota"*|IDLE*)
+          hits=0 hit=
+          for id in "${!prov_of[@]}"; do
+            if [[ $id == "$t"* ]]; then hits=$(( hits + 1 )); hit=$id; fi
+          done
+          if (( hits == 1 )); then
+            p=${prov_of[$hit]}
+            case ${ltext[i]} in
+              IDLE*) lim_state[$p]=OK ;;
+              *)     lim_state[$p]=FAIL; lim_ts[$p]=${lts[i]} ;;
+            esac
+          fi ;;
+      esac
     done
   fi
 
@@ -408,6 +569,11 @@ while true; do
     (( over )) && summary+="$off"
   fi
 
+  build_limits wide
+  if (( ${#limits_plain} > cols )); then build_limits narrow; fi
+  top=$summary lim_rows=0
+  if [[ -n $limits_line ]]; then top+=$'\n'"$limits_line"; lim_rows=1; fi
+
   header=$(printf '%s%-3s%-4s %-6s ' "$bold" '#' STS AGE)
   header+=$(printf '%-30s ' SESSION)
   (( show_proj )) && header+=$(printf '%-12s ' PROJECT)
@@ -423,7 +589,7 @@ while true; do
 
   if [[ -n $rows ]]; then
     lines=$(tput lines 2>/dev/null || echo 40)
-    max_rows=$(( lines - 3 )); (( max_rows < 5 )) && max_rows=5
+    max_rows=$(( lines - 3 - lim_rows )); (( max_rows < 5 )) && max_rows=5
     sorted=$(printf '%s' "$rows" | sort -n -k1,1 | head -n "$max_rows")
     body= n=0 listed=
     while IFS=$'\t' read -r _ sid line; do
@@ -432,13 +598,15 @@ while true; do
       listed+="$sid"$'\n'
     done <<< "$sorted"
     printf '%s' "$listed" > "$SESSION_LIST"
-    frame="$summary"$'\n'"$header"$'\n'"${body%$'\n'}"
+    frame="$top"$'\n'"$header"$'\n'"${body%$'\n'}"
   else
     : > "$SESSION_LIST"
-    frame="$summary"$'\n'"$header"$'\n'"${dim}no sessions in the last 24h${off}"
+    frame="$top"$'\n'"$header"$'\n'"${dim}no sessions in the last 24h${off}"
   fi
 
-  if (( urgent > 0 )); then pane_title="$BASE_NAME ⚠${urgent}"; else pane_title="$BASE_NAME"; fi
+  pane_title=$BASE_NAME
+  (( urgent > 0 )) && pane_title+=" ⚠${urgent}"
+  (( limits_hit > 0 )) && pane_title+=" · limit ${limits_hit}"
   if [[ -n ${ZELLIJ_PANE_ID:-} && $pane_title != "$prev_title" ]]; then
     zellij action rename-pane -p "$ZELLIJ_PANE_ID" "$pane_title" >/dev/null 2>&1
     prev_title=$pane_title

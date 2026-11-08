@@ -1,0 +1,118 @@
+#!/bin/bash
+# agent-limits — subscription-limit meters for the Agent Inbox.
+# Part of the agent-ops project: https://github.com/Mario8289/agent-ops
+#
+#   agent-limits refresh   fetch every configured provider, write the cache
+#   agent-limits [show]    print what is cached (all windows, reset times)
+#
+# agent-inbox calls `refresh` in the background about once a minute and only
+# ever reads the cache, so the pane never waits on the network.
+#
+# One file per provider in ~/.cache/agent-ops/limits/<name>.json:
+#   { "name": "devpass", "label": "DP", "status": "ok", "updated": 1731063000,
+#     "plan": "lite",
+#     "windows": [ { "label": "day", "pct": 51, "resets": 1731162795 } ] }
+# `resets` is epoch seconds or null. A file that stops updating is shown dimmed
+# by the inbox, so a dead fetcher never looks like plenty of headroom.
+#
+# ADAPTER SEAM — a provider is a `fetch_<name>` function plus an entry in
+# PROVIDERS. It writes its file with `put` and returns 2 when it is not
+# configured on this machine (nothing is written, nothing is shown).
+#
+# DevPass: GET /v1/key with the gateway key (the documented DevPass Usage API).
+# The key comes from $DEVPASS_API_KEY or ~/.config/agent-ops/devpass-key
+# (chmod 600); the file is for when the pane does not inherit your shell's
+# environment. Daily pacing, monthly credits and the weekly premium allowance
+# become three windows.
+[[ -r "${AGENT_OPS_CONFIG:-$HOME/.config/agent-ops/config}" ]] && source "${AGENT_OPS_CONFIG:-$HOME/.config/agent-ops/config}"
+
+set -uo pipefail
+
+CFG_DIR="${AGENT_OPS_DIR:-$HOME/.config/agent-ops}"
+DIR="${AGENT_LIMITS_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/agent-ops/limits}"
+PROVIDERS=(devpass)
+
+# put <name> <json>: atomic write so a reader never sees half a file.
+put() {
+  mkdir -p "$DIR"
+  printf '%s\n' "$2" > "$DIR/$1.json.tmp.$$" && mv -f "$DIR/$1.json.tmp.$$" "$DIR/$1.json"
+}
+
+fetch_devpass() {
+  local key=${DEVPASS_API_KEY:-} url out code body
+  if [[ -z $key && -r $CFG_DIR/devpass-key ]]; then
+    key=$(head -n1 "$CFG_DIR/devpass-key" | tr -d '[:space:]')
+  fi
+  [[ -n $key ]] || return 2
+
+  url="${DEVPASS_BASE_URL:-https://api.llmgateway.io/v1}/key"
+  out=$(curl -sS -m 8 -w '\n%{http_code}' -H "Authorization: Bearer $key" "$url" 2>/dev/null) || return 1
+  code=${out##*$'\n'}
+  body=${out%$'\n'*}
+
+  if [[ $code == 401 || $code == 403 ]]; then
+    put devpass "$(jq -cn --argjson now "$(date +%s)" \
+      '{name:"devpass", label:"DP", status:"auth", updated:$now, windows:[]}')"
+    return 1
+  fi
+  [[ $code == 200 ]] || return 1
+
+  body=$(printf '%s' "$body" | jq -c --argjson now "$(date +%s)" '
+    def num: tonumber? // 0;
+    def pct($used; $limit):
+      ($limit | num) as $l
+      | if $l > 0 then ((($used | num) / $l * 100) | floor) else empty end;
+    def epoch: if . == null then null else (sub("\\.[0-9]+"; "") | fromdateiso8601) end;
+    .data as $d
+    | { name: "devpass", label: "DP", status: "ok", updated: $now,
+        plan: ($d.devPlan // "none"),
+        windows: (if ($d.devPlan // "none") == "none" then [] else [
+          { label: "day",     pct: pct($d.devPlanDailyCreditsUsed;   $d.devPlanDailyLimit),
+            resets: ($d.devPlanDayResetsAt | epoch) },
+          { label: "month",   pct: pct($d.devPlanCreditsUsed;        $d.devPlanCreditsLimit),
+            resets: null },
+          { label: "premium", pct: pct($d.devPlanPremiumCreditsUsed; $d.devPlanPremiumWeeklyLimit),
+            resets: ($d.devPlanPremiumWeekResetsAt | epoch) }
+        ] | map(select(.pct != null)) end) }' 2>/dev/null) || return 1
+  [[ -n $body ]] || return 1
+  put devpass "$body"
+}
+
+# 3700 -> 1h1m, 540 -> 9m, 200000 -> 2d
+dur() {
+  local s=${1:-0}
+  (( s < 0 )) && s=0
+  if (( s < 3600 )); then printf '%dm' $(( s / 60 ))
+  elif (( s < 86400 )); then printf '%dh%dm' $(( s / 3600 )) $(( s % 3600 / 60 ))
+  else printf '%dd' $(( s / 86400 )); fi
+}
+
+show() {
+  local now f name label status updated plan
+  now=$(date +%s)
+  shopt -s nullglob
+  local files=("$DIR"/*.json)
+  if (( ${#files[@]} == 0 )); then
+    echo "no limits cached yet — run: agent-limits refresh"
+    return 0
+  fi
+  for f in "${files[@]}"; do
+    IFS=$'\t' read -r name label status updated plan < <(jq -r '[.name, .label, .status, .updated, (.plan // "-")] | @tsv' "$f")
+    printf '%s (%s)  plan %s  %s  updated %s ago\n' "$name" "$label" "$plan" "$status" "$(dur $(( now - updated )))"
+    jq -r '.windows[] | [.label, .pct, (.resets // 0)] | @tsv' "$f" | while IFS=$'\t' read -r wl wp wr; do
+      if (( wr > 0 )); then
+        printf '   %-8s %3d%%  resets in %s\n' "$wl" "$wp" "$(dur $(( wr - now )))"
+      else
+        printf '   %-8s %3d%%\n' "$wl" "$wp"
+      fi
+    done
+  done
+}
+
+case "${1:-show}" in
+  refresh)
+    for p in "${PROVIDERS[@]}"; do "fetch_$p" || true; done
+    ;;
+  show) show ;;
+  *) echo "usage: agent-limits [show|refresh]" >&2; exit 2 ;;
+esac

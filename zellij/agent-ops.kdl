@@ -3,7 +3,8 @@
 //
 // One column, tuned for a tall narrow window (~78 cols x 65 rows, e.g. 30% of a
 // screen):
-//   top    (20%): Agent Inbox — one row per recent session, worst first,
+//   top    (21%): Agent Inbox — a summary line, a subscription-limits line
+//                 (agent-limits), then one row per recent session, worst first,
 //                 with its status, age, and total tokens / cost so far. Retitles
 //                 itself "Agent
 //                 Inbox ⚠N" when N sessions need you. Needs the agent-log
@@ -13,7 +14,7 @@
 //                 Alt+Up/Down or click a collapsed title. Add one at runtime
 //                 with `znp pcode/agent-ant` (no argument = home); remove with
 //                 `zellij action close-pane`.
-//   bottom (10%): System — compact: Docker summary + CPU/DISK/RAM, one per line.
+//   bottom (9%):  System — compact: Docker summary + CPU/DISK/RAM, one per line.
 //                 Expand the pane to reveal SWAP, the OpenCode service state, and
 //                 a "⚠ TOP" line naming the program when CPU/RAM/swap is high.
 //                 For a scratch shell, add a pane with `znp` or Ctrl+t n.
@@ -39,13 +40,13 @@ layout {
 
     tab name="Agent Ops" {
         pane split_direction="horizontal" {
-            pane name="Agent Inbox" command="agent-inbox" size="20%"
+            pane name="Agent Inbox" command="agent-inbox" size="21%"
             pane stacked=true size="70%" {
                 pane name="dotfiles"  cwd="/home/marriotta/pcode/dotfiles" focus=true expanded=true
                 pane name="agent-ant" cwd="/home/marriotta/pcode/agent-ant"
                 pane name="brain"     cwd="/home/marriotta/pcode/brain"
             }
-            pane name="System" command="sys" size="10%"
+            pane name="System" command="sys" size="9%"
         }
     }
 }
