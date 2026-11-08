@@ -23,7 +23,8 @@
 #
 # TOKENS is the running total for the whole session (input + output + cache read
 # + cache write). COST is the provider's reported dollar figure. MODEL is the
-# session's agent and model (e.g. "build·deepseek-v4-pro"). SUB is how many child
+# session's agent and model (e.g. "build/deepseek-v4-pro"; ASCII "/" so the
+# padded column width is exact). SUB is how many child
 # sessions the run has spawned (yellow when any are busy). TITLE is the session's
 # own title; it grows into leftover width so the table fills a wide pane. GIT is
 # its branch plus changed-file count. PR is the open pull request for that branch
@@ -130,6 +131,14 @@ prev_title=
 COL_W=(53 66 74 91 110 125 133 138)
 HYST=4
 prev_n=7
+
+# Redraw promptly on resize. `wait` returns as soon as a trapped signal arrives,
+# whereas `sleep` ignores SIGWINCH, so a resize is noticed in ~ms instead of
+# after the full 2s tick. The trap kills the background sleep so ticks cannot
+# pile up, and `resized` also skips the sleep if the signal landed mid-frame.
+resized=0
+slp=
+trap 'resized=1; [[ -n $slp ]] && kill "$slp" 2>/dev/null' WINCH
 
 # Git status cache: running `git status` every 2s over up to 12 projects is too
 # slow, so each directory is checked at most every GIT_INTERVAL seconds. Values
@@ -269,7 +278,7 @@ while true; do
     fi
     (( show_proj )) && row+=$(printf '%-12s ' "$(clip "${dir##*/}" 12)")
     (( show_title )) && row+=$(printf "%-${title_w}s " "$(clip "$stitle" "$title_w")")
-    (( show_model )) && row+=$(printf '%-18s ' "$(clip "${agent:+$agent·}$modelid" 18)")
+    (( show_model )) && row+=$(printf '%-18s ' "$(clip "${agent:+$agent/}$modelid" 18)")
     if (( show_git )); then
       gcell= gcol=$dim
       if [[ -z $dir ]]; then
@@ -411,5 +420,9 @@ while true; do
     printf '%s\n' "$frame"
     prev=$cols$frame
   fi
-  sleep 2
+  if (( ! resized )); then
+    sleep 2 & slp=$!
+    wait "$slp" 2>/dev/null
+  fi
+  resized=0
 done
