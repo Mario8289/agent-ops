@@ -31,7 +31,12 @@
 # pending/draft, "-" = no open PR).
 #
 # SUB, PR, GIT, MODEL, TITLE, COST and PROJECT are dropped, in that order, when
-# the pane is too narrow. PROJECT survives down to ~66; TITLE appears from ~91.
+# the pane is too narrow (PROJECT goes last, surviving down to ~66). Widening
+# reveals them in the reverse order, but only once there are HYST columns to
+# spare, so a pane parked on a threshold does not flap between two layouts:
+#   PROJECT ~66  COST ~74  TITLE ~95 (also flexes to fill)  MODEL ~114
+#   GIT ~129  PR ~137  SUB ~142
+# Shrinking is immediate (fit always wins over stability).
 #
 # A summary line sits above the table: "⚠N need you · M RUN · $X/24h". The
 # dollar figure is rolling-24h spend across all sessions, approximated from
@@ -117,6 +122,15 @@ clip() {
 prev=
 prev_title=
 
+# Drop-ladder state. COL_W[n] is the rendered width with the first n optional
+# columns shown, in reveal order: PROJECT, COST, TITLE, MODEL, GIT, PR, SUB
+# (nested — n columns means the first n). HYST is how many spare columns are
+# required before revealing another column. It must stay below the smallest gap
+# between consecutive thresholds (5, between PR at 133 and SUB at 138).
+COL_W=(53 66 74 91 110 125 133 138)
+HYST=4
+prev_n=7
+
 # Git status cache: running `git status` every 2s over up to 12 projects is too
 # slow, so each directory is checked at most every GIT_INTERVAL seconds. Values
 # are ASCII so the GIT column pads cleanly: "." = not a repo, "branch" = clean,
@@ -135,21 +149,28 @@ while true; do
   cols=$(tput cols 2>/dev/null || echo 120)
   (( cols > 40 )) || cols=120
 
-  # Drop optional columns when the pane is narrow. The ID must stay whole (it
-  # is meant to be copied).
-  show_git=1; show_pr=1; show_sub=1; show_model=1; show_title=1; show_proj=1; show_cost=1
-  # Each width below includes its trailing space, so `width` equals the real
-  # rendered line length. That keeps the TITLE flex math (title_w = 16 + cols -
-  # width) landing exactly on the pane edge instead of overshooting it.
-  fixed=$(( 3 + 5 + 7 + 31 + 7 ))   # # STS AGE SESSION TOKENS
-  width=$(( fixed + 15 + 8 + 5 + 19 + 17 + 13 + 8 ))  # + GIT PR SUB MODEL TITLE PROJECT COST
-  if (( width > cols )); then show_sub=0;    width=$(( width - 5 )); fi
-  if (( width > cols )); then show_pr=0;     width=$(( width - 8 )); fi
-  if (( width > cols )); then show_git=0;    width=$(( width - 15 )); fi
-  if (( width > cols )); then show_model=0;  width=$(( width - 19 )); fi
-  if (( width > cols )); then show_title=0;  width=$(( width - 17 )); fi
-  if (( width > cols )); then show_cost=0;   width=$(( width - 8 )); fi
-  if (( width > cols )); then show_proj=0;   width=$(( width - 13 )); fi
+  # Pick how many optional columns fit, with hysteresis so resizing by a column
+  # or two does not flip a column on and off. Shrink immediately while the pane
+  # is narrower than the current layout (fit beats stability); grow only when
+  # there are HYST columns to spare. COL_W values include every trailing space,
+  # so `width` equals the real rendered line length and the TITLE flex math
+  # (title_w = 16 + cols - width) lands exactly on the pane edge.
+  n=$prev_n
+  while (( n > 0 && cols < COL_W[n] )); do n=$(( n - 1 )); done
+  while (( n < 7 && cols >= COL_W[n + 1] + HYST )); do n=$(( n + 1 )); done
+  prev_n=$n
+  width=${COL_W[n]}
+
+  # Reveal order: PROJECT, COST, TITLE, MODEL, GIT, PR, SUB.
+  show_proj=0; show_cost=0; show_title=0; show_model=0
+  show_git=0; show_pr=0; show_sub=0
+  (( n >= 1 )) && show_proj=1
+  (( n >= 2 )) && show_cost=1
+  (( n >= 3 )) && show_title=1
+  (( n >= 4 )) && show_model=1
+  (( n >= 5 )) && show_git=1
+  (( n >= 6 )) && show_pr=1
+  (( n >= 7 )) && show_sub=1
 
   # TITLE is flexible: it grows into whatever width is left over, so the table
   # fills the pane on a wide screen instead of leaving blank space.
