@@ -78,19 +78,33 @@ cd agent-ops
 `install.sh` symlinks (doesn't copy), so `git pull` in the repo updates your
 setup immediately.
 
-### Manual steps
+### First-time setup
 
-Some things can't be automated:
+After `install.sh` and `configure`:
 
 1. **Restart OpenCode** so the `agent-log` plugin loads:
    `opencode service restart`
-2. **Phone notifications** (if enabled): install the [ntfy](https://ntfy.sh)
+2. **Subscription limits** (optional, see [Limits line](#limits-line)):
+   - DevPass: make `DEVPASS_API_KEY` visible to the process that starts Zellij,
+     or put the key in `~/.config/agent-ops/devpass-key` (`chmod 600`).
+   - Google, OpenCode Go and others without a usage API: list them in
+     `~/.config/agent-ops/limits-providers`, one `providerID LABEL` per line:
+     ```
+     google GG
+     opencode-go GO
+     ```
+     Provider IDs are the ones OpenCode uses; list them with
+     `opencode api provider.list | jq -r '.. | .id? // empty'` or look at the
+     `model.providerID` of `opencode api session.list`.
+   - Check it works: `agent-limits refresh && agent-limits show`
+3. **Phone notifications** (if enabled): install the [ntfy](https://ntfy.sh)
    app, subscribe to the topic `configure` printed, and leave the server as
    `ntfy.sh`.
-3. **Zellij**: open the layout with `zellij --layout agent-ops` (or set it as
-   your default layout in `config.kdl`).
 4. **Shell helpers**: `configure` can append the `source` line to `~/.zshrc`;
-   otherwise add it yourself.
+   otherwise add it yourself, then open a new shell.
+5. **Start it**: `zellij --layout agent-ops` (or make it your default layout in
+   `config.kdl`). Layout sizes only apply when a Zellij session is created; a
+   running session keeps its old pane sizes.
 
 ## Configuration
 
@@ -102,6 +116,15 @@ Some things can't be automated:
 | `AGENT_LOG` | where the plugin writes events (default `~/agent-runs/agent_health.log`) |
 | `AGENT_SESSION_LIST` | the row→ID cache the inbox writes for `sd`/`so` |
 | `AGENT_BUDGET_FILE` | path to the optional daily budget file |
+| `AGENT_LIMIT_WARN` | limits line turns yellow at this percent (default `70`) |
+| `AGENT_LIMIT_ALERT` | limits line turns red at this percent (default `90`) |
+| `AGENT_LIMITS_PROVIDERS` | path to the `limits-providers` file |
+| `AGENT_LIMITS_DIR` | where `agent-limits` caches (default `~/.cache/agent-ops/limits`) |
+| `DEVPASS_BASE_URL` | DevPass API base (default `https://api.llmgateway.io/v1`) |
+
+`config` is plain shell, sourced by `agent-inbox`, `agent-limits` and the shell
+helpers, so any variable in this table can be set there. Keep secrets out of it:
+the ntfy topic and the DevPass key live in their own `chmod 600` files below.
 
 Optional files:
 
@@ -115,18 +138,33 @@ Optional files:
   one `providerID LABEL` per line (e.g. `google GG`, `opencode-go GO`). A
   provider that hits `provider.quota` is shown even if it is not listed.
 
+## Limits line
+
+The second line of the Agent Inbox shows subscription meters, written by
+`agent-limits` and read by `agent-inbox` from a cache. Add a provider with a
+usage API as a `fetch_<name>` function in `bin/agent-limits` that writes
+`~/.cache/agent-ops/limits/<name>.json`:
+
+```json
+{"name":"devpass","label":"DP","status":"ok","updated":1731063000,
+ "plan":"lite","windows":[{"label":"day","pct":53,"resets":1731162795}]}
+```
+
+A provider that stops updating its file is shown dimmed after five minutes.
+
 ## The adapter seam
 
 `bin/agent-inbox` is deliberately split: everything above this line is generic
-rendering; the three functions below are the only harness-specific part.
+rendering; the four functions below are the only harness-specific part.
 
 ```sh
 source_fetch()    # fetch raw session data (opencode api session.list)
 source_sessions() # -> id upd busy dir title tot cost kids busykids agent model (TSV)
 source_spend()    # -> rolling 24h spend
+source_providers() # -> session id and provider ID, for every session (TSV)
 ```
 
-To target another harness, reimplement those three. Everything else — status
+To target another harness, reimplement those four. Everything else — status
 derivation, columns, summary, notifications, `so`/`sd` — stays put.
 
 ## How it works
