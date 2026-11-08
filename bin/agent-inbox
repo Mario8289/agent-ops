@@ -26,8 +26,8 @@
 # session's agent and model (e.g. "build/deepseek-v4-pro"; ASCII "/" so the
 # padded column width is exact). SUB is how many child
 # sessions the run has spawned (yellow when any are busy). TITLE is the session's
-# own title; leftover width grows TITLE first, then MODEL, so a wide pane shows
-# complete titles and model names instead of padding TITLE while MODEL is cut. GIT is
+# own title; leftover width grows TITLE first, then MODEL, and any remainder
+# becomes a gap before TOKENS so the numbers stay right-aligned. GIT is
 # its branch plus changed-file count. PR is the open pull request for that branch
 # with its CI state ("#12" green = passing, "#12!" red = failing, "#12?" yellow =
 # pending/draft, "-" = no open PR).
@@ -164,7 +164,8 @@ while true; do
   # is narrower than the current layout (fit beats stability); grow only when
   # there are HYST columns to spare. COL_W values include every trailing space,
   # so `width` is the base layout width (TITLE and MODEL at their minimums); the
-  # leftover `cols - width` is split between TITLE and MODEL further down.
+  # leftover `cols - width` is split between TITLE, MODEL and a spacer before
+  # TOKENS further down.
   n=$prev_n
   while (( n > 0 && cols < COL_W[n] )); do n=$(( n - 1 )); done
   while (( n < 7 && cols >= COL_W[n + 1] + HYST )); do n=$(( n + 1 )); done
@@ -193,9 +194,9 @@ while true; do
 
   # Flex the leftover width across the content columns instead of dumping it all
   # into TITLE. TITLE grows first, but only until the longest title fits; then
-  # MODEL grows until the longest agent/model fits. Whatever is left after both
-  # are fully visible goes back to TITLE. This stops a short-title table from
-  # showing a huge empty TITLE column while MODEL is still clipped.
+  # MODEL grows until the longest agent/model fits. Whatever is left becomes a
+  # spacer between the content columns and TOKENS, so the numeric columns stay
+  # right-aligned at the pane edge instead of padding TITLE.
   max_title=0 max_model=0
   while IFS=$'\t' read -r _id _upd _busy _dir stitle _tot _cost _kids _bk agent modelid; do
     [[ -n $_id ]] || continue
@@ -204,7 +205,7 @@ while true; do
     (( ${#mm} > max_model )) && max_model=${#mm}
   done <<< "$data"
 
-  title_w=16 model_w=18
+  title_w=16 model_w=18 spacer=0
   if (( show_title )); then
     extra=$(( cols - width )); (( extra < 0 )) && extra=0
     title_need=$(( max_title > 16 ? max_title - 16 : 0 ))
@@ -215,7 +216,10 @@ while true; do
       b=$(( extra < model_need ? extra : model_need ))
       model_w=$(( 18 + b )); extra=$(( extra - b ))
     fi
-    title_w=$(( title_w + extra ))
+    spacer=$extra
+  else
+    # TITLE is hidden, so the whole gap before TOKENS is spacer.
+    spacer=$(( cols - width )); (( spacer < 0 )) && spacer=0
   fi
 
   budget=
@@ -372,6 +376,7 @@ while true; do
       fi
     fi
     toks=-; (( tot > 0 )) && toks=$(human "$tot")
+    row+=$(printf '%*s' "$spacer" '')
     row+=$(printf '%-6s ' "$toks")
     if (( show_cost )); then
       costs=-
@@ -411,6 +416,7 @@ while true; do
   (( show_git ))   && header+=$(printf '%-14s ' GIT)
   (( show_pr ))    && header+=$(printf '%-7s ' PR)
   (( show_sub ))   && header+=$(printf '%-4s ' SUB)
+  header+=$(printf '%*s' "$spacer" '')
   header+=$(printf '%-6s ' TOKENS)
   (( show_cost )) && header+=$(printf '%-7s ' COST)
   header+=$off
