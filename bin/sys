@@ -2,18 +2,19 @@
 # System — compact Docker + resource dashboard for the "Agent Ops" Zellij layout.
 # Part of the agent-ops project: https://github.com/Mario8289/agent-ops
 #
-#   DOCKER   daemon state, running count, image/container/volume totals
-#            (no per-container list — `docker ps` for that)
-#   CPU      usage since the previous tick + 1m load
-#   RAM      used / total
-#   DISK     root filesystem
-#   SWAP     used / total (red once it is really in use)
-#   OPENCODE background `opencode serve` service state
-#   ⚠ TOP    a flag, shown only when something is off: CPU >= 70% for three
-#            ticks in a row, RAM >= 80%, or swap >= 50%. It names the program
-#            using the most memory / CPU, summed per program name (so 30
-#            browser processes count as one "chrome"). Otherwise no line.
-#            Thresholds: SYS_CPU_FLAG, SYS_RAM_FLAG, SYS_SWAP_FLAG.
+#   Compact (the pane at its normal ~10% height), one metric per line:
+#     DOCKER   daemon state, running count, image/container/volume totals
+#     CPU      usage since the previous tick + 1m load
+#     DISK     root filesystem
+#     RAM      used / total
+#   Expanded (when the pane is taller — e.g. after expanding it) adds:
+#     SWAP     used / total (red once it is really in use)
+#     OPENCODE background `opencode serve` service state
+#     ⚠ TOP    a flag, shown only when something is off: CPU >= 70% for three
+#              ticks in a row, RAM >= 80%, or swap >= 50%. It names the program
+#              using the most memory / CPU, summed per program name (so 30
+#              browser processes count as one "chrome"). Otherwise no line.
+#              Thresholds: SYS_CPU_FLAG, SYS_RAM_FLAG, SYS_SWAP_FLAG.
 #
 # Redraws every 2s, but only when the frame changes, and overwrites in place
 # instead of clearing, so mouse selection survives long enough to copy text.
@@ -65,6 +66,12 @@ cpu_flag=${SYS_CPU_FLAG:-70} ram_flag=${SYS_RAM_FLAG:-80} swap_flag=${SYS_SWAP_F
 df_summary=""
 
 while true; do
+  # --- Terminal size: pick compact vs expanded, and size the bars ---
+  cols=$(tput cols 2>/dev/null || echo 80); (( cols > 20 )) || cols=80
+  rows=$(tput lines 2>/dev/null || echo 5); (( rows > 0 )) || rows=5
+  bar_w=$(( cols - 36 )); (( bar_w < 8 )) && bar_w=8; (( bar_w > 40 )) && bar_w=40
+  expanded=0; (( rows >= 7 )) && expanded=1
+
   # --- CPU: delta since the previous tick ---
   read -r _cpu u n s i w irq sirq st _rest < /proc/stat
   total=$((u + n + s + i + w + irq + sirq + st))
@@ -127,9 +134,10 @@ while true; do
 
   if pgrep -f "opencode serve --service" >/dev/null 2>&1; then svc=1; else svc=0; fi
 
-  # --- Build the frame: three lines, so the pane can stay short ---
+  # --- Build the frame: compact = DOCKER + one line per resource; expanded
+  # (pane tall enough) adds SWAP, OPENCODE and the ⚠ TOP flag. ---
   frame=$(
-    printf '%sDOCKER%s ' "$bold" "$off"
+    printf '%s%-8s%s ' "$bold" DOCKER "$off"
     if ((docker_up)); then
       printf '%s●%s %s running' "$green" "$off" "$running"
       [[ -n $df_summary ]] && printf ' · %s' "$df_summary"
@@ -137,27 +145,34 @@ while true; do
       printf '%s● down%s' "$red" "$off"
     fi
     printf '\n'
-    printf 'CPU %s%s%s %3d%%  load %s   RAM %s%s%s %3d%%  %s/%s\n' \
-      "$(pct_color "$cpu_pct")" "$(bar "$cpu_pct" 8)" "$off" "$cpu_pct" "$l1" \
-      "$(pct_color "$ram_pct")" "$(bar "$ram_pct" 8)" "$off" "$ram_pct" "$(h "$mem_used")" "$(h "$mem_total")"
-    printf 'DISK %s%s%s %3d%%  %s/%s' \
-      "$(pct_color "$disk_pct")" "$(bar "$disk_pct" 8)" "$off" "$disk_pct" "$(h "$disk_used")" "$(h "$disk_total")"
-    if (( swap_total > 0 )); then
-      swap_c=$dim
-      if (( swap_pct >= 50 )); then swap_c=$red; elif (( swap_used > 0 )); then swap_c=$yellow; fi
-      printf '   %sSWAP %s/%s%s' "$swap_c" "$(h "$swap_used")" "$(h "$swap_total")" "$off"
-    else
-      printf '   %sSWAP none%s' "$dim" "$off"
-    fi
-    printf '   OPENCODE %s\n' \
-      "$([[ $svc == 1 ]] && printf '%s●%s' "$green" "$off" || printf '%s○ down%s' "$red" "$off")"
-    flag_cpu=$(( cpu_hot >= 3 ))
-    flag_mem=$(( ram_pct >= ram_flag || (swap_total > 0 && swap_pct >= swap_flag) ))
-    if (( flag_cpu || flag_mem )); then
-      printf '%s⚠ TOP%s ' "$yellow" "$off"
-      (( flag_mem )) && printf ' mem %.14s %s ' "${top_mem_name:--}" "$(h "${top_mem_bytes:-0}")"
-      (( flag_cpu )) && printf ' cpu %.14s %s%%' "${top_cpu_name:-…}" "${top_cpu_pct:-0}"
-      printf '\n'
+    printf '%-8s %s%s%s %3d%%  load %s\n' CPU \
+      "$(pct_color "$cpu_pct")" "$(bar "$cpu_pct" "$bar_w")" "$off" "$cpu_pct" "$l1"
+    printf '%-8s %s%s%s %3d%%  %s/%s\n' DISK \
+      "$(pct_color "$disk_pct")" "$(bar "$disk_pct" "$bar_w")" "$off" "$disk_pct" "$(h "$disk_used")" "$(h "$disk_total")"
+    printf '%-8s %s%s%s %3d%%  %s/%s\n' RAM \
+      "$(pct_color "$ram_pct")" "$(bar "$ram_pct" "$bar_w")" "$off" "$ram_pct" "$(h "$mem_used")" "$(h "$mem_total")"
+    if (( expanded )); then
+      if (( swap_total > 0 )); then
+        swap_c=$dim
+        if (( swap_pct >= 50 )); then swap_c=$red; elif (( swap_used > 0 )); then swap_c=$yellow; fi
+        printf '%-8s %s%s%s %3d%%  %s/%s\n' SWAP \
+          "$swap_c" "$(bar "$swap_pct" "$bar_w")" "$off" "$swap_pct" "$(h "$swap_used")" "$(h "$swap_total")"
+      else
+        printf '%-8s %snone%s\n' SWAP "$dim" "$off"
+      fi
+      if (( svc == 1 )); then
+        printf '%-8s %s●%s running\n' OPENCODE "$green" "$off"
+      else
+        printf '%-8s %s○ down%s\n' OPENCODE "$red" "$off"
+      fi
+      flag_cpu=$(( cpu_hot >= 3 ))
+      flag_mem=$(( ram_pct >= ram_flag || (swap_total > 0 && swap_pct >= swap_flag) ))
+      if (( flag_cpu || flag_mem )); then
+        printf '%s⚠ TOP%s  ' "$yellow" "$off"
+        (( flag_mem )) && printf 'mem %.14s %s  ' "${top_mem_name:--}" "$(h "${top_mem_bytes:-0}")"
+        (( flag_cpu )) && printf 'cpu %.14s %s%%' "${top_cpu_name:-…}" "${top_cpu_pct:-0}"
+        printf '\n'
+      fi
     fi
   )
 
