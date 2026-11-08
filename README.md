@@ -123,6 +123,9 @@ AGENT_LIMITS_TRACK="google:GG opencode-go:GO" # providers to show hatched bars f
 #AGENT_LIMIT_STALE=300      # seconds before a cached limit is shown dimmed
 ```
 
+`./configure` reuses your previous answers as defaults on a re-run. Answer `-`
+to clear a value that has a default.
+
 ### Secrets (chmod 600, kept separate)
 
 To keep `config` safe for public dotfiles or sharing, secrets live in their own files:

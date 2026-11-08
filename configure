@@ -110,6 +110,7 @@ cat >> "$CFG" <<'EOF'
 #AGENT_LIMITS_REFRESH=60    # seconds between background fetches
 #AGENT_LIMIT_STALE=300      # seconds before a meter is shown dimmed
 EOF
+chmod 644 "$CFG"   # no secrets in here; ntfy-topic and devpass-key stay 600
 say
 say "wrote $CFG"
 
