@@ -41,9 +41,7 @@ layout {
         pane split_direction="horizontal" {
             pane name="Agent Inbox" command="agent-inbox" size="21%"
             pane stacked=true size="70%" {
-                pane name="dotfiles"  cwd="/home/marriotta/pcode/dotfiles" focus=true expanded=true
-                pane name="agent-ant" cwd="/home/marriotta/pcode/agent-ant"
-                pane name="brain"     cwd="/home/marriotta/pcode/brain"
+                pane name="home" cwd="/home/marriotta" focus=true expanded=true
             }
             pane name="System" command="sys" size="9%"
         }
