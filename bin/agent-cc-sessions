@@ -5,6 +5,8 @@
 #   agent-cc-sessions sessions    one TSV record per recent session
 #   agent-cc-sessions spend       rolling 24h cost
 #   agent-cc-sessions providers   "harness<TAB>id<TAB>provider" per session
+#   agent-cc-sessions resolve <cc_id>   "uuid<TAB>cwd" for re-opening
+#   agent-cc-sessions path <cc_id>      the transcript file path (for deletion)
 #
 # Claude Code has no server to query, so this scrapes the per-session JSONL
 # transcripts under ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl. That
@@ -140,10 +142,24 @@ cmd_resolve() {
   printf '%s\t%s\n' "$uuid" "$cwd"
 }
 
+# path <cc_id> — print the full transcript file path for a truncated inbox id
+# ("cc_" + first 12 UUID chars). `sd` uses this to delete a Claude Code session,
+# which means removing its transcript (Claude Code keeps no other state). Not
+# limited to the recent window. Prints nothing and returns 1 if not found.
+cmd_path() {
+  local ccid=$1 frag path
+  frag=${ccid#cc_}
+  [[ -n $frag ]] || return 1
+  path=$(find "$PROJECTS_DIR" -name "${frag}*.jsonl" -type f 2>/dev/null | head -1)
+  [[ -n $path ]] || return 1
+  printf '%s\n' "$path"
+}
+
 case "${1:-sessions}" in
   sessions)  cmd_sessions ;;
   spend)     cmd_spend ;;
   providers) cmd_providers ;;
   resolve)   cmd_resolve "${2:-}" ;;
-  *) echo "usage: agent-cc-sessions [sessions|spend|providers|resolve <cc_id>]" >&2; exit 2 ;;
+  path)      cmd_path "${2:-}" ;;
+  *) echo "usage: agent-cc-sessions [sessions|spend|providers|resolve <cc_id>|path <cc_id>]" >&2; exit 2 ;;
 esac

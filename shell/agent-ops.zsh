@@ -42,15 +42,48 @@ _session_ref() {
   print -r -- "$id"
 }
 
-# sd [-i] <number|session-id> — delete an OpenCode session (and its children).
+# sd [-i] <number|session-id> — delete a session.
+#   ses_  OpenCode: deletes the session and its children via the API.
+#   cc_   Claude Code: removes the session transcript (Claude Code keeps no
+#         other state). This is irreversible, so it always confirms first,
+#         regardless of -i.
+# Either way the id is also dropped from the archive file, so a deleted session
+# never leaves a dangling "done" mark behind.
 sd() {
-  local confirm=0 id info title dir reply
+  local confirm=0 id label reply
   if [[ $1 == -i || $1 == --interactive ]]; then confirm=1; shift; fi
   if [[ -z $1 ]]; then
     print -u2 "usage: sd [-i] <number|session-id>   (numbers are Agent Inbox rows)"
     return 1
   fi
-  id=$(_session_ref sd "$1") || return 1
+  id=$(_session_ref sd "$1" allow_cc) || return 1
+
+  if [[ $id == cc_* ]]; then
+    local ccbin ccfile
+    ccbin=$(command -v agent-cc-sessions 2>/dev/null)
+    if [[ -z $ccbin ]]; then
+      print -u2 "sd: agent-cc-sessions not found on PATH (can't delete a Claude Code session)"
+      return 1
+    fi
+    ccfile=$("$ccbin" path "$id" 2>/dev/null)
+    if [[ -z $ccfile || ! -f $ccfile ]]; then
+      print -u2 "sd: no Claude Code transcript for $id"
+      return 1
+    fi
+    label=$(_session_label "$id")
+    print -r -- "Claude Code session $id"
+    print -r -- "  ${label:-(no title)}"
+    print -r -- "  file:  $ccfile"
+    # Always confirm: removing the transcript is irreversible.
+    read -r "reply?Delete this session's transcript? This cannot be undone. [y/N] "
+    [[ $reply == [yY] ]] || { print -r -- "aborted"; return 1 }
+    rm -f -- "$ccfile" || { print -u2 "sd: could not remove $ccfile"; return 1 }
+    _sd_unarchive "$id"
+    print -r -- "deleted $id"
+    return 0
+  fi
+
+  local info title dir
   info=$(opencode api session.get --param "sessionID=$id" 2>/dev/null)
   if [[ -z $(print -r -- "$info" | jq -r '.data.id // empty' 2>/dev/null) ]]; then
     print -u2 "sd: no session with id $id"
@@ -66,6 +99,18 @@ sd() {
     [[ $reply == [yY] ]] || { print -r -- "aborted"; return 1 }
   fi
   opencode session delete "$id"
+  _sd_unarchive "$id"
+}
+
+# _sd_unarchive <id> — drop an id from the archive file after it is deleted, so
+# no stale "done" mark lingers. No-op if the file or id is absent.
+_sd_unarchive() {
+  local id=$1 tmp
+  [[ -r $_ARCHIVED_FILE ]] || return 0
+  grep -qxF -- "$id" "$_ARCHIVED_FILE" 2>/dev/null || return 0
+  tmp=$(mktemp "${_ARCHIVED_FILE}.XXXXXX") || return 0
+  grep -vxF -- "$id" "$_ARCHIVED_FILE" > "$tmp" 2>/dev/null
+  mv -f "$tmp" "$_ARCHIVED_FILE"
 }
 
 # _session_label <id> — a short "title (project)" for an id, for confirming
