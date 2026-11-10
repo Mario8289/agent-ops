@@ -114,13 +114,20 @@ esac
 # read into ARCHIVED_FLAG so the long-tail list can flag those rows.
 ARCHIVED_FILE="${AGENT_ARCHIVED_FILE:-$HOME/.config/agent-ops/archived}"
 unset ARCHIVED ARCHIVED_FLAG; declare -A ARCHIVED=() ARCHIVED_FLAG=()
-if [[ -r $ARCHIVED_FILE ]]; then
+# Re-read the archived file from disk, replacing the in-memory set. The live
+# pane calls this once per render tick so `sa`/`sl` take effect within one tick
+# instead of only on restart; the loop persists its own auto-unarchive changes
+# to disk before the next read, so disk stays the source of truth.
+load_archived() {
+  unset ARCHIVED ARCHIVED_FLAG; declare -gA ARCHIVED=() ARCHIVED_FLAG=()
+  [[ -r $ARCHIVED_FILE ]] || return
   while IFS= read -r _aid; do
     [[ -n $_aid ]] || continue
     ARCHIVED_FLAG[$_aid]=1
     (( ALL_MODE )) || ARCHIVED[$_aid]=1
   done < "$ARCHIVED_FILE"
-fi
+}
+load_archived
 
 # ---- opencode: the OpenCode server API ----
 OC_ROWS_JQ='.data as $all
@@ -455,6 +462,10 @@ while true; do
   term_size; cols=$TCOLS
   (( cols > 40 )) || cols=120
 
+  # Pick up archive changes made by `sa`/`sl` since the last tick. Disk is the
+  # source of truth; the auto-unarchive path below writes back before the next
+  # read, so this cannot clobber a mark the loop just cleared.
+  load_archived
   # Pick how many optional columns fit, with hysteresis so resizing by a column
   # or two does not flip a column on and off. Shrink immediately while the pane
   # is narrower than the current layout (fit beats stability); grow only when
