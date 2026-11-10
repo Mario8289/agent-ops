@@ -45,8 +45,8 @@ _session_ref() {
 # sd [-i] <number|session-id> — delete a session.
 #   ses_  OpenCode: deletes the session and its children via the API.
 #   cc_   Claude Code: removes the session transcript (Claude Code keeps no
-#         other state). This is irreversible, so it always confirms first,
-#         regardless of -i.
+#         other state). This is irreversible but, like OpenCode, deletes without
+#         prompting; pass -i to confirm first.
 # Either way the id is also dropped from the archive file, so a deleted session
 # never leaves a dangling "done" mark behind.
 sd() {
@@ -74,9 +74,10 @@ sd() {
     print -r -- "Claude Code session $id"
     print -r -- "  ${label:-(no title)}"
     print -r -- "  file:  $ccfile"
-    # Always confirm: removing the transcript is irreversible.
-    read -r "reply?Delete this session's transcript? This cannot be undone. [y/N] "
-    [[ $reply == [yY] ]] || { print -r -- "aborted"; return 1 }
+    if (( confirm )); then
+      read -r "reply?Delete this session's transcript? This cannot be undone. [y/N] "
+      [[ $reply == [yY] ]] || { print -r -- "aborted"; return 1 }
+    fi
     rm -f -- "$ccfile" || { print -u2 "sd: could not remove $ccfile"; return 1 }
     _sd_unarchive "$id"
     print -r -- "deleted $id"
