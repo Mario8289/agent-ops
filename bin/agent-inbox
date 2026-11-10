@@ -15,16 +15,19 @@
 # (~/agent-runs/agent_health.log): the plugin subscribes to the official event
 # stream, and the file is the durable record of why a run ended.
 #
-# ADAPTER SEAM — `source_sessions` emits one tab-separated record per session:
-#   id  upd  busy  dir  title  tot  cost  kids  busykids  agent  model
-# (upd is epoch seconds). Backed by OpenCode today; a different harness (e.g.
-# pi.dev) only has to reimplement `source_fetch`, `source_sessions`,
-# `source_spend` and `source_providers` (id and provider ID per session).
+# ADAPTER SEAM — each harness is a source adapter (four functions named
+# <harness>_fetch / _sessions / _spend / _providers). `source_sessions` emits
+# one tab-separated record per session, HARNESS first:
+#   harness  id  upd  busy  dir  title  tot  cost  kids  busykids  agent  model
+# (upd is epoch seconds). OpenCode and Claude Code ship today; AGENT_SOURCES
+# (config) lists which to run, and the inbox merges their rows. A new harness
+# only has to add the four functions and its name to AGENT_SOURCES.
 #
 # TOKENS is the running total for the whole session (input + output + cache read
-# + cache write). COST is the provider's reported dollar figure. MODEL is the
-# session's agent and model (e.g. "build/deepseek-v4-pro"; ASCII "/" so the
-# padded column width is exact). SUB is how many child
+# + cache write). COST is the provider's reported dollar figure. HRN is the
+# harness the session runs in (OC = OpenCode, CC = Claude Code), always shown.
+# MODEL is the session's agent and model (e.g. "build/deepseek-v4-pro"; ASCII
+# "/" so the padded column width is exact). SUB is how many child
 # sessions the run has spawned (yellow when any are busy). TITLE is the session's
 # own title; leftover width grows TITLE first, then MODEL, and any remainder
 # becomes a gap before TOKENS so the numbers stay right-aligned. GIT is
@@ -32,12 +35,13 @@
 # with its CI state ("#12" green = passing, "#12!" red = failing, "#12?" yellow =
 # pending/draft, "-" = no open PR).
 #
-# SUB, PR, GIT, MODEL, TITLE, COST and PROJECT are dropped, in that order, when
-# the pane is too narrow (PROJECT goes last, surviving down to ~66). Widening
-# reveals them in the reverse order, but only once there are HYST columns to
-# spare, so a pane parked on a threshold does not flap between two layouts:
-#   PROJECT ~66  COST ~74  TITLE ~95 (also flexes to fill)  MODEL ~114
-#   GIT ~129  PR ~137  SUB ~142
+# SUB, PR, GIT, MODEL, TITLE, COST, PROJECT and HARNESS are dropped, in that
+# order, when the pane is too narrow (HARNESS goes last — the cc_/ses_ id prefix
+# still shows the harness without it). Widening reveals them in reverse, but only
+# once there are HYST columns to spare, so a pane parked on a threshold does not
+# flap between two layouts. Approximate reveal thresholds (pane columns):
+#   HARNESS ~56  PROJECT ~69  COST ~77  TITLE ~94 (also flexes to fill)
+#   MODEL ~113  GIT ~128  PR ~136  SUB ~141
 # Shrinking is immediate (fit always wins over stability).
 #
 # A summary line sits above the table: "⚠N need you · M RUN · $X/24h". The
@@ -79,14 +83,53 @@ SESSION_LIST="${SESSION_LIST:-${AGENT_SESSION_LIST:-${XDG_CACHE_HOME:-$HOME/.cac
 mkdir -p "$(dirname "$SESSION_LIST")"
 
 # ---- adapter seam ----
-# Emits one tab-separated record per session (see header). Today it reads the
-# OpenCode server API; a different harness only has to reimplement these four.
-ROWS_JQ='.data as $all
+# Each harness is a source adapter: four functions named <harness>_fetch /
+# _sessions / _spend / _providers. source_* below just iterate the harnesses in
+# AGENT_SOURCES and concatenate their output, so the renderer stays unaware of
+# which harness a row came from. To add a harness, write the four functions and
+# add its name to AGENT_SOURCES (config); nothing else changes.
+#
+# _sessions emits one tab-separated record per session, HARNESS first:
+#   harness  id  upd  busy  dir  title  tot  cost  kids  busykids  agent  model
+# (upd is epoch seconds). _providers emits "harness<TAB>id<TAB>provider".
+AGENT_SOURCES="${AGENT_SOURCES:-opencode}"
+
+# How many sessions to fetch and consider for display, across all harnesses.
+# The pane height caps how many of these are actually drawn (see max_rows); this
+# caps how many are fetched and ranked. Raise it in config when you run many
+# concurrent sessions and a tall pane can show more than the default.
+MAX_ROWS="${AGENT_MAX_ROWS:-12}"
+
+# --all: print the full session list once (uncapped, archive filter off, archived
+# rows flagged) and exit — no live pane. `sl` calls this to browse the long tail.
+# In this mode MAX_ROWS is lifted so every session in the window is considered.
+ALL_MODE=0
+case ${1:-} in
+  --all) ALL_MODE=1; MAX_ROWS=100000 ;;
+esac
+
+# Archived set: sessions the user marked "done" with `sa`. Hidden from the live
+# pane (but shown, and auto-unarchived, if they go ASK/FAIL/DEAD). One id per
+# line. In --all mode the filter is off (ARCHIVED empty) but the marks are still
+# read into ARCHIVED_FLAG so the long-tail list can flag those rows.
+ARCHIVED_FILE="${AGENT_ARCHIVED_FILE:-$HOME/.config/agent-ops/archived}"
+unset ARCHIVED ARCHIVED_FLAG; declare -A ARCHIVED=() ARCHIVED_FLAG=()
+if [[ -r $ARCHIVED_FILE ]]; then
+  while IFS= read -r _aid; do
+    [[ -n $_aid ]] || continue
+    ARCHIVED_FLAG[$_aid]=1
+    (( ALL_MODE )) || ARCHIVED[$_aid]=1
+  done < "$ARCHIVED_FILE"
+fi
+
+# ---- opencode: the OpenCode server API ----
+OC_ROWS_JQ='.data as $all
   | ($all | map(select((.parentID // null) != null))) as $children
   | $all | map(select((.parentID // null) == null))
   | map(. as $s
       | ($children | map(select(.parentID == $s.id))) as $mine
-      | [ $s.id,
+      | [ "opencode",
+          $s.id,
           (($s.time.updated // 0) / 1000 | floor),
           (if (($s.time.busy // 0) > ($s.time.idle // 0)) then 1 else 0 end),
           ($s.location.directory // ""),
@@ -98,21 +141,50 @@ ROWS_JQ='.data as $all
           ([ $mine[] | select((.time.busy // 0) > (.time.idle // 0)) ] | length),
           ($s.agent // ""),
           ($s.model.id // "") ])
-  | sort_by(.[1]) | reverse | .[0:12]
+  | sort_by(.[2]) | reverse | .[0:$max]
   | .[] | @tsv'
 
 # Rolling 24h spend across all sessions, approximated from session totals.
-SPEND_JQ='[ .data[] | select((.time.updated // 0) > ((now - 86400) * 1000)) | (.cost // 0) ] | add // 0'
+OC_SPEND_JQ='[ .data[] | select((.time.updated // 0) > ((now - 86400) * 1000)) | (.cost // 0) ] | add // 0'
 
-_raw=
-source_fetch()    { _raw=$(opencode api session.list 2>/dev/null); }
-source_sessions() { printf '%s' "$_raw" | jq -r "$ROWS_JQ" 2>/dev/null; }
-source_spend()    { printf '%s' "$_raw" | jq -r "$SPEND_JQ" 2>/dev/null; }
+# "harness<TAB>id<TAB>provider" for every session (not just the shown rows), so
+# a quota failure is pinned on the right provider even for an older session.
+OC_PROVIDERS_JQ='.data[] | select((.model.providerID // "") != "") | [ "opencode", .id, .model.providerID ] | @tsv'
 
-# "session-id<TAB>provider" for every session (not just the shown rows), so a
-# quota failure is pinned on the right provider even for an older session.
-PROVIDERS_JQ='.data[] | select((.model.providerID // "") != "") | [ .id, .model.providerID ] | @tsv'
-source_providers() { printf '%s' "$_raw" | jq -r "$PROVIDERS_JQ" 2>/dev/null; }
+_oc_raw=
+opencode_fetch()     { _oc_raw=$(opencode api session.list 2>/dev/null); }
+opencode_sessions()  { printf '%s' "$_oc_raw" | jq -r --argjson max "$MAX_ROWS" "$OC_ROWS_JQ" 2>/dev/null; }
+opencode_spend()     { printf '%s' "$_oc_raw" | jq -r "$OC_SPEND_JQ" 2>/dev/null; }
+opencode_providers() { printf '%s' "$_oc_raw" | jq -r "$OC_PROVIDERS_JQ" 2>/dev/null; }
+
+# ---- claude: Claude Code transcripts (~/.claude/projects/*/*.jsonl) ----
+# Claude Code has no server to query, so a helper script scrapes the per-session
+# JSONL transcripts. It is kept separate from the inbox so the brittle,
+# schema-dependent parsing lives in one place; when the transcript format
+# changes, only that script needs fixing.
+CC_BIN="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/agent-cc-sessions"
+[[ -x $CC_BIN ]] || CC_BIN=$(command -v agent-cc-sessions 2>/dev/null || true)
+claude_fetch()     { :; }   # the helper reads the filesystem directly
+claude_sessions()  { [[ -n $CC_BIN ]] && CC_MAX="$MAX_ROWS" "$CC_BIN" sessions 2>/dev/null; }
+claude_spend()     { [[ -n $CC_BIN ]] && CC_MAX="$MAX_ROWS" "$CC_BIN" spend 2>/dev/null; }
+claude_providers() { [[ -n $CC_BIN ]] && CC_MAX="$MAX_ROWS" "$CC_BIN" providers 2>/dev/null; }
+
+# ---- dispatchers: run every enabled harness, concatenate ----
+source_fetch() { local h; for h in $AGENT_SOURCES; do "${h}_fetch"; done; }
+source_sessions() {
+  local h
+  for h in $AGENT_SOURCES; do "${h}_sessions"; done |
+    sort -t$'\t' -k3,3nr | head -n "$MAX_ROWS"
+}
+source_spend() {
+  local h total=0 s
+  for h in $AGENT_SOURCES; do
+    s=$("${h}_spend"); [[ $s =~ ^-?[0-9] ]] || s=0
+    total=$(awk -v a="$total" -v b="$s" 'BEGIN { printf "%.6f", a + b }')
+  done
+  printf '%s' "$total"
+}
+source_providers() { local h; for h in $AGENT_SOURCES; do "${h}_providers"; done; }
 
 # Optional daily budget in dollars. When set and the 24h spend reaches it, the
 # summary line's spend turns red. AGENT_BUDGET in the config (e.g. 4.64); the
@@ -139,6 +211,15 @@ human() {
 clip() {
   local s=$1 n=$2
   if (( ${#s} > n )); then printf '%s' "${s:0:n-3}..."; else printf '%s' "$s"; fi
+}
+
+# Harness name -> two-letter column label.
+harness_label() {
+  case $1 in
+    opencode) printf 'OC' ;;
+    claude)   printf 'CC' ;;
+    *)        local u=${1^^}; printf '%s' "${u:0:2}" ;;
+  esac
 }
 
 prev=
@@ -316,13 +397,15 @@ render_limits() {
 }
 
 # Drop-ladder state. COL_W[n] is the rendered width with the first n optional
-# columns shown, in reveal order: PROJECT, COST, TITLE, MODEL, GIT, PR, SUB
-# (nested — n columns means the first n). HYST is how many spare columns are
-# required before revealing another column. It must stay below the smallest gap
-# between consecutive thresholds (5, between PR at 133 and SUB at 138).
-COL_W=(53 66 74 91 110 125 133 138)
-HYST=4
-prev_n=7
+# columns shown, in reveal order: PROJECT, COST, TITLE, MODEL, HARNESS, GIT, PR,
+# SUB (nested — n columns means the first n). HARNESS sits mid-ladder: the cc_/
+# ses_ id prefix already shows the harness, so the HRN column is a convenience —
+# it is dropped before GIT/PR/SUB but kept once there is real room. HYST is how
+# many spare columns are required before revealing another column. It must stay
+# below the smallest gap between consecutive thresholds (3, at the HRN step).
+COL_W=(53 66 74 91 110 113 128 136 141)
+HYST=2
+prev_n=8
 
 # Redraw promptly on resize. `wait` returns as soon as a trapped signal arrives,
 # whereas `sleep` ignores SIGWINCH, so a resize is noticed in ~ms instead of
@@ -331,6 +414,28 @@ prev_n=7
 resized=0
 slp=
 trap 'resized=1; [[ -n $slp ]] && kill "$slp" 2>/dev/null' WINCH
+
+# Pane size, read live from the controlling terminal. `tput cols`/`tput lines`
+# trust the COLUMNS/LINES environment, which inside a Zellij pane can be stale
+# or 0 (the pane was created narrow, or the var was exported before the layout
+# settled) — that pins the inbox to 80 cols in a much wider pane. Reading the
+# size straight off the terminal with `stty` tracks the real pane size through
+# every resize. We query fd 2 (stderr), which stays attached to the pane's tty
+# even when stdout is redirected, and guard it so a missing tty falls through to
+# tput and then a sane default without erroring (there may be no tty at all).
+term_size() {
+  local sz=
+  if [[ -t 2 ]]; then
+    sz=$(stty size <&2 2>/dev/null)
+  elif { : < /dev/tty; } 2>/dev/null; then
+    sz=$(stty size < /dev/tty 2>/dev/null)
+  fi
+  if [[ $sz =~ ^([0-9]+)[[:space:]]+([0-9]+)$ ]]; then
+    TROWS=${BASH_REMATCH[1]}; TCOLS=${BASH_REMATCH[2]}; return
+  fi
+  TCOLS=$(tput cols 2>/dev/null); [[ $TCOLS =~ ^[0-9]+$ ]] || TCOLS=120
+  TROWS=$(tput lines 2>/dev/null); [[ $TROWS =~ ^[0-9]+$ ]] || TROWS=40
+}
 
 # Git status cache: running `git status` every 2s over up to 12 projects is too
 # slow, so each directory is checked at most every GIT_INTERVAL seconds. Values
@@ -347,7 +452,7 @@ declare -A pr_last=() pr_cell=()
 
 while true; do
   now=$(date +%s)
-  cols=$(tput cols 2>/dev/null || echo 120)
+  term_size; cols=$TCOLS
   (( cols > 40 )) || cols=120
 
   # Pick how many optional columns fit, with hysteresis so resizing by a column
@@ -359,20 +464,21 @@ while true; do
   # TOKENS further down.
   n=$prev_n
   while (( n > 0 && cols < COL_W[n] )); do n=$(( n - 1 )); done
-  while (( n < 7 && cols >= COL_W[n + 1] + HYST )); do n=$(( n + 1 )); done
+  while (( n < 8 && cols >= COL_W[n + 1] + HYST )); do n=$(( n + 1 )); done
   prev_n=$n
   width=${COL_W[n]}
 
-  # Reveal order: PROJECT, COST, TITLE, MODEL, GIT, PR, SUB.
-  show_proj=0; show_cost=0; show_title=0; show_model=0
+  # Reveal order: PROJECT, COST, TITLE, MODEL, HARNESS, GIT, PR, SUB.
+  show_hrn=0; show_proj=0; show_cost=0; show_title=0; show_model=0
   show_git=0; show_pr=0; show_sub=0
   (( n >= 1 )) && show_proj=1
   (( n >= 2 )) && show_cost=1
   (( n >= 3 )) && show_title=1
   (( n >= 4 )) && show_model=1
-  (( n >= 5 )) && show_git=1
-  (( n >= 6 )) && show_pr=1
-  (( n >= 7 )) && show_sub=1
+  (( n >= 5 )) && show_hrn=1
+  (( n >= 6 )) && show_git=1
+  (( n >= 7 )) && show_pr=1
+  (( n >= 8 )) && show_sub=1
 
   # Map log events onto sessions. The log tag is the id prefix — 8 chars in
   # lines written so far, 12 in newer plugin versions. The leading chars are
@@ -390,21 +496,30 @@ while true; do
   fi
 
   # Flex the leftover width across the content columns instead of dumping it all
-  # into TITLE. TITLE grows first, but only until the longest title fits; then
-  # MODEL grows until the longest agent/model fits. Whatever is left becomes a
-  # spacer between the content columns and TOKENS, so the numeric columns stay
-  # right-aligned at the pane edge instead of padding TITLE.
-  max_title=0 max_model=0
-  while IFS=$'\t' read -r _id _upd _busy _dir stitle _tot _cost _kids _bk agent modelid; do
+  # into TITLE. PROJECT grows first (so full project names show when there's
+  # room), then TITLE, then MODEL — each only until its longest value fits.
+  # Whatever is left becomes a spacer between the content columns and TOKENS, so
+  # the numeric columns stay right-aligned at the pane edge.
+  max_title=0 max_model=0 max_proj=0
+  while IFS=$'\t' read -r _harness _id _upd _busy _dir stitle _tot _cost _kids _bk agent modelid; do
     [[ -n $_id ]] || continue
     (( ${#stitle} > max_title )) && max_title=${#stitle}
     mm="${agent:+$agent/}$modelid"
     (( ${#mm} > max_model )) && max_model=${#mm}
+    _pname=${_dir##*/}
+    (( ${#_pname} > max_proj )) && max_proj=${#_pname}
   done <<< "$data"
 
-  title_w=16 model_w=18 spacer=0
+  title_w=16 model_w=18 proj_w=12 spacer=0
+  extra=$(( cols - width )); (( extra < 0 )) && extra=0
+  if (( show_proj )); then
+    # PROJECT grows first (up to the longest project name) so full names show
+    # when there is room; the 12-col base is already baked into COL_W/width.
+    proj_need=$(( max_proj > 12 ? max_proj - 12 : 0 ))
+    p=$(( extra < proj_need ? extra : proj_need ))
+    proj_w=$(( 12 + p )); extra=$(( extra - p ))
+  fi
   if (( show_title )); then
-    extra=$(( cols - width )); (( extra < 0 )) && extra=0
     title_need=$(( max_title > 16 ? max_title - 16 : 0 ))
     a=$(( extra < title_need ? extra : title_need ))
     title_w=$(( 16 + a )); extra=$(( extra - a ))
@@ -415,8 +530,8 @@ while true; do
     fi
     spacer=$extra
   else
-    # TITLE is hidden, so the whole gap before TOKENS is spacer.
-    spacer=$(( cols - width )); (( spacer < 0 )) && spacer=0
+    # TITLE is hidden, so whatever width is left (after PROJECT grew) is spacer.
+    spacer=$extra
   fi
 
   budget=${AGENT_BUDGET:-}
@@ -433,7 +548,7 @@ while true; do
 
   unset ev; declare -A ev=()
   unset lim_state lim_ts prov_of; declare -A lim_state=() lim_ts=() prov_of=()
-  while IFS=$'\t' read -r _sid _p; do [[ -n $_sid ]] && prov_of[$_sid]=$_p; done < <(source_providers)
+  while IFS=$'\t' read -r _h _sid _p; do [[ -n $_sid ]] && prov_of[$_sid]=$_p; done < <(source_providers)
   if [[ -r $LOG && -n $data ]]; then
     unset ltag ltext lts; declare -a ltag=() ltext=() lts=()
     while IFS= read -r line; do
@@ -447,7 +562,7 @@ while true; do
     done < <(tail -n 400 "$LOG" 2>/dev/null)
 
     unset ids; declare -a ids=()
-    while IFS=$'\t' read -r id _; do [[ -n $id ]] && ids+=("$id"); done <<< "$data"
+    while IFS=$'\t' read -r _ id _; do [[ -n $id ]] && ids+=("$id"); done <<< "$data"
 
     # Log lines are in time order, so the last quota failure or success seen
     # for a provider decides its state. The log tag is an id prefix, so look
@@ -476,7 +591,8 @@ while true; do
   fi
 
   rows= urgent=0 running=0
-  while IFS=$'\t' read -r id upd busy dir stitle tot cost kids busykids agent modelid; do
+  unset UNARCHIVE; declare -a UNARCHIVE=()
+  while IFS=$'\t' read -r harness id upd busy dir stitle tot cost kids busykids agent modelid; do
     [[ -n $id ]] || continue
     age=$(( now - upd ))
     if (( age < 3600 )); then a="$(( age / 60 ))m"
@@ -505,6 +621,17 @@ while true; do
       else st=IDLE; c=$yellow; fi
     fi
 
+    # Archived ("done") sessions are hidden from the live pane — unless they
+    # need you again (ASK/FAIL/DEAD/STOP), in which case show them and clear the
+    # mark so "done" can never bury something urgent. In --all mode nothing is
+    # archived (ARCHIVED is empty), so every row is shown and flagged below.
+    if [[ -n ${ARCHIVED[$id]:-} ]]; then
+      case $st in
+        ASK|FAIL|DEAD|STOP) UNARCHIVE+=("$id"); unset "ARCHIVED[$id]" ;;
+        *) continue ;;
+      esac
+    fi
+
     # Rows needing attention rise to the top, then working, then idle.
     case $st in
       ASK|FAIL|DEAD|STOP) rank=0 ;;
@@ -513,15 +640,24 @@ while true; do
     esac
 
     row=$(printf '%s%-4s%s %-6s ' "$bold$c" "$st" "$off" "$a")
+    # SESSION cell: pad the id to the header's 30-char field width. Colour codes
+    # confuse printf's %-30s (it counts the escape bytes), so pad the *visible*
+    # string first, then wrap in colour. cc_ ids are much shorter than ses_ ids,
+    # so without this the columns after SESSION would not line up.
     if [[ -n $focused_ses && $id == "$focused_ses" ]]; then
-      row+="${rev}${id}${off} "
+      row+=$(printf '%s%-30s%s ' "$rev" "$id" "$off")
+    elif (( ALL_MODE )) && [[ -n ${ARCHIVED_FLAG[$id]:-} ]]; then
+      # Long-tail list: flag archived rows so "done" sessions are visible but
+      # distinguishable. A trailing " (archived)" is cheap and greppable.
+      row+=$(printf '%s%-30s%s ' "$dim" "$id (archived)" "$off")
     else
-      row+="${dim}${id}${off} "
+      row+=$(printf '%s%-30s%s ' "$dim" "$id" "$off")
     fi
-    (( show_proj )) && row+=$(printf '%-12s ' "$(clip "${dir##*/}" 12)")
+    (( show_proj )) && row+=$(printf "%-${proj_w}s " "$(clip "${dir##*/}" "$proj_w")")
     (( show_title )) && row+=$(printf "%-${title_w}s " "$(clip "$stitle" "$title_w")")
     modelstr="${agent:+$agent/}$modelid"
     (( show_model )) && row+=$(printf "%-${model_w}s " "$(clip "$modelstr" "$model_w")")
+    (( show_hrn )) && row+=$(printf '%s%-2s%s ' "$dim" "$(harness_label "$harness")" "$off")
     if (( show_git )); then
       gcell= gcol=$dim
       if [[ -z $dir ]]; then
@@ -601,8 +737,19 @@ while true; do
       fi
       row+=$(printf '%-7s ' "$costs")
     fi
-    rows+="$rank"$'\t'"$id"$'\t'"$row"$'\n'
+    rows+="$rank"$'\t'"$age"$'\t'"$id"$'\t'"$row"$'\n'
   done <<< "$data"
+
+  # Auto-unarchive: a session marked "done" that came back needing you was shown
+  # above and dropped from ARCHIVED in the loop. Persist that by rewriting the
+  # file atomically, but only when the set actually shrank, so a quiet render
+  # never touches disk. (Never in --all mode: that read-only view keeps marks.)
+  if (( ! ALL_MODE )) && (( ${#UNARCHIVE[@]} > 0 )); then
+    tmp=$(mktemp "${ARCHIVED_FILE}.XXXXXX" 2>/dev/null) && {
+      for _aid in "${!ARCHIVED[@]}"; do printf '%s\n' "$_aid"; done | sort > "$tmp"
+      mv -f "$tmp" "$ARCHIVED_FILE"
+    }
+  fi
 
   # One-line summary: what needs you, what's running, and rolling 24h spend.
   spends=-
@@ -640,9 +787,10 @@ while true; do
 
   header=$(printf '%s%-3s%-4s %-6s ' "$bold" '#' STS AGE)
   header+=$(printf '%-30s ' SESSION)
-  (( show_proj )) && header+=$(printf '%-12s ' PROJECT)
+  (( show_proj )) && header+=$(printf "%-${proj_w}s " PROJECT)
   (( show_title )) && header+=$(printf "%-${title_w}s " TITLE)
   (( show_model )) && header+=$(printf "%-${model_w}s " MODEL)
+  (( show_hrn ))   && header+=$(printf '%-2s ' HRN)
   (( show_git ))   && header+=$(printf '%-14s ' GIT)
   (( show_pr ))    && header+=$(printf '%-7s ' PR)
   (( show_sub ))   && header+=$(printf '%-4s ' SUB)
@@ -652,20 +800,33 @@ while true; do
   header+=$off
 
   if [[ -n $rows ]]; then
-    lines=$(tput lines 2>/dev/null || echo 40)
+    lines=$TROWS
     max_rows=$(( lines - 3 )); (( max_rows < 5 )) && max_rows=5
-    sorted=$(printf '%s' "$rows" | sort -n -k1,1 | head -n "$max_rows")
+    # --all prints every row once (no pane cap); the live pane caps to its height.
+    (( ALL_MODE )) && max_rows=1000000
+    # Sort rows by status rank (attention first), then by age so that within a
+    # status the most recently active session is on top — that is the best proxy
+    # for "what I'm working on". The age tiebreak also stops one harness's rows
+    # (which arrive grouped and pre-sorted) from clustering ahead of the other's.
+    sorted=$(printf '%s' "$rows" | sort -t$'\t' -k1,1n -k2,2n | head -n "$max_rows")
     body= n=0 listed=
-    while IFS=$'\t' read -r _ sid line; do
+    while IFS=$'\t' read -r _ _ sid line; do
       n=$(( n + 1 ))
       body+=$(printf '%s%2d%s ' "$dim" "$n" "$off")"$line"$'\n'
       listed+="$sid"$'\n'
     done <<< "$sorted"
-    printf '%s' "$listed" > "$SESSION_LIST"
+    # Don't clobber the live row→id mapping with the uncapped --all order.
+    (( ALL_MODE )) || printf '%s' "$listed" > "$SESSION_LIST"
     frame="$top"$'\n'"$header"$'\n'"${body%$'\n'}"
   else
-    : > "$SESSION_LIST"
+    (( ALL_MODE )) || : > "$SESSION_LIST"
     frame="$top"$'\n'"$header"$'\n'"${dim}no sessions in the last 24h${off}"
+  fi
+
+  # --all is a one-shot snapshot: print and exit, no pane title, no live loop.
+  if (( ALL_MODE )); then
+    printf '%s\n' "$frame"
+    exit 0
   fi
 
   pane_title=$BASE_NAME

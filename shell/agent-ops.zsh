@@ -3,8 +3,10 @@
 #
 #   so <row|id>  open a session (focus its pane, or create one)
 #   sd <row|id>  delete a session
-#   sc           continue the last session in this directory
-#   sn           start a new session in this directory
+#   sa <row|id>  archive (mark done) — hides it from the live inbox; -u to undo
+#   sl           list the full long tail (uncapped, archived rows flagged)
+#   sc [-o|-c]   continue the last session here (-o OpenCode, -c Claude)
+#   sn [-o|-c]   start a new session here (-o OpenCode, -c Claude)
 #   znp [path]   add a project shell to the Zellij stack
 #   zdp [name]   close a pane
 #
@@ -16,11 +18,14 @@
 [[ -r "${AGENT_OPS_CONFIG:-$HOME/.config/agent-ops/config}" ]] && source "${AGENT_OPS_CONFIG:-$HOME/.config/agent-ops/config}"
 
 _SESSION_LIST_CACHE="${AGENT_SESSION_LIST:-${XDG_CACHE_HOME:-$HOME/.cache}/opencode-session-list}"
+_ARCHIVED_FILE="${AGENT_ARCHIVED_FILE:-$HOME/.config/agent-ops/archived}"
 
-# _session_ref <cmd> <number|session-id> — print the session ID for an Agent
-# Inbox row number (via the cache file) or pass a full ID through.
+# _session_ref <cmd> <number|session-id> [allow_cc] — print the session ID for
+# an Agent Inbox row number (via the cache file) or pass a full ID through.
+# Claude Code rows (ids prefixed "cc_") are rejected unless the caller passes a
+# non-empty third arg (so handles them; sd/sa do not control them from here).
 _session_ref() {
-  local cmd=$1 ref=$2 id
+  local cmd=$1 ref=$2 allow_cc=${3:-} id
   if [[ $ref == <-> ]]; then
     id=$(sed -n "${ref}p" "$_SESSION_LIST_CACHE" 2>/dev/null)
     if [[ -z $id ]]; then
@@ -29,6 +34,10 @@ _session_ref() {
     fi
   else
     id=$ref
+  fi
+  if [[ $id == cc_* && -z $allow_cc ]]; then
+    print -u2 "$cmd: '$id' is a Claude Code session — not supported by $cmd yet"
+    return 1
   fi
   print -r -- "$id"
 }
@@ -59,6 +68,77 @@ sd() {
   opencode session delete "$id"
 }
 
+# _session_label <id> — a short "title (project)" for an id, for confirming
+# which session a command is about to act on (rows re-sort, so the number you
+# typed may not be what you saw). Best-effort: OpenCode via the API, Claude Code
+# via its transcript dir. Prints nothing if it can't resolve.
+_session_label() {
+  local id=$1 title dir
+  if [[ $id == cc_* ]]; then
+    local ccbin out
+    ccbin=$(command -v agent-cc-sessions 2>/dev/null) || return
+    out=$("$ccbin" resolve "$id" 2>/dev/null)
+    dir=${out#*$'\t'}; [[ $dir == "$out" ]] && dir=
+  else
+    local info
+    info=$(opencode api session.get --param "sessionID=$id" 2>/dev/null)
+    title=$(print -r -- "$info" | jq -r '.data.title // empty' 2>/dev/null)
+    dir=$(print -r -- "$info" | jq -r '.data.location.directory // empty' 2>/dev/null)
+  fi
+  local out=
+  [[ -n $title ]] && out=$title
+  [[ -n $dir ]] && out="${out:+$out }(${dir:t})"
+  [[ -n $out ]] && print -r -- "$out"
+}
+
+# sa [-u] <number|session-id> — archive a session ("I'm done with this"), hiding
+# it from the live Agent Inbox without deleting its transcript. -u un-archives.
+# Works for both OpenCode (ses_) and Claude Code (cc_) rows — archiving is just
+# a mark on your side, harness-agnostic. The inbox auto-unarchives a session
+# that later goes ASK/FAIL/DEAD, so "done" can never bury something urgent.
+# Browse archived (and aged-out) sessions any time with `sl`. Prints the
+# session's title/project so you can catch a row-number mismatch (rows re-sort).
+sa() {
+  local undo=0 id tmp label
+  if [[ $1 == -u || $1 == --undo ]]; then undo=1; shift; fi
+  if [[ -z $1 ]]; then
+    print -u2 "usage: sa [-u] <number|session-id>   (numbers are Agent Inbox rows)"
+    return 1
+  fi
+  id=$(_session_ref sa "$1" allow_cc) || return 1
+  label=$(_session_label "$id")
+  mkdir -p "${_ARCHIVED_FILE:h}" 2>/dev/null
+  touch "$_ARCHIVED_FILE" 2>/dev/null
+  if (( undo )); then
+    tmp=$(mktemp "${_ARCHIVED_FILE}.XXXXXX") || return 1
+    grep -vxF -- "$id" "$_ARCHIVED_FILE" > "$tmp" 2>/dev/null
+    mv -f "$tmp" "$_ARCHIVED_FILE"
+    print -r -- "un-archived $id${label:+  — $label}"
+  else
+    if grep -qxF -- "$id" "$_ARCHIVED_FILE" 2>/dev/null; then
+      print -r -- "already archived: $id${label:+  — $label}"
+      return 0
+    fi
+    print -r -- "$id" >> "$_ARCHIVED_FILE"
+    print -r -- "archived $id${label:+  — $label}"
+    print -r -- "  (hidden from the live inbox; sa -u to undo, sl to list)"
+  fi
+}
+
+# sl — list the full long tail: every session in the window, uncapped and with
+# archived rows shown and flagged. A one-shot snapshot (not the live pane), so
+# it's safe to scroll and pipe to grep. Does not disturb the live inbox's row
+# numbering. Honours COLUMNS for width.
+sl() {
+  local bin
+  bin=$(command -v agent-inbox 2>/dev/null)
+  if [[ -z $bin ]]; then
+    print -u2 "sl: agent-inbox not found on PATH"
+    return 1
+  fi
+  "$bin" --all "$@"
+}
+
 # so <number|session-id> — open a session in OpenCode, from anywhere.
 # In Zellij: if the session is already open in a pane, focus that pane; else
 # open it in a new stacked pane named after the project, in the project's
@@ -71,7 +151,15 @@ so() {
     print -u2 "usage: so <number|session-id>   (numbers are Agent Inbox rows)"
     return 1
   fi
-  id=$(_session_ref so "$1") || return 1
+  id=$(_session_ref so "$1" allow_cc) || return 1
+
+  # Claude Code row: recover the full UUID + cwd from its transcript and resume
+  # it with `claude --resume`. No pane-title watcher (see _cc_run).
+  if [[ $id == cc_* ]]; then
+    _cc_open "$id" "${@:2}"
+    return
+  fi
+
   if [[ ! $id =~ ^ses_[A-Za-z0-9]+$ ]]; then
     print -u2 "so: '$id' is not a session ID"
     return 1
@@ -118,11 +206,102 @@ so() {
   ( cd "$dir" && _oc_run -s "$id" "${@:2}" )
 }
 
-# sc — continue the last session in this directory (opencode --continue).
-sc() { _oc_run --continue "$@" }
+# _cc_open <cc_id> [extra args] — re-open a Claude Code session by its inbox id.
+# Resolves the truncated "cc_" id back to the full UUID and cwd via
+# agent-cc-sessions, then (in Zellij) focuses an existing/idle pane or opens a
+# new one running `claude --resume <uuid>`. No pane-title watcher (see _cc_run).
+_cc_open() {
+  local id=$1 ccbin out uuid dir
+  ccbin=$(command -v agent-cc-sessions 2>/dev/null)
+  if [[ -z $ccbin ]]; then
+    print -u2 "so: agent-cc-sessions not found — cannot re-open Claude sessions"
+    return 1
+  fi
+  out=$("$ccbin" resolve "$id" 2>/dev/null)
+  uuid=${out%%$'\t'*}
+  dir=${out#*$'\t'}
+  if [[ -z $uuid || $uuid == "$out" ]]; then
+    print -u2 "so: could not find a Claude Code transcript for '$id'"
+    return 1
+  fi
+  if [[ -z $dir || ! -d $dir ]]; then
+    print -u2 "so: the session's directory no longer exists: ${dir:-?}"
+    return 1
+  fi
+  if ! command -v claude >/dev/null 2>&1; then
+    print -u2 "so: claude not found — install Claude Code to re-open its sessions"
+    return 1
+  fi
+  if [[ -n ${ZELLIJ:-} && $# -eq 1 ]]; then
+    local name=${dir:t} panes idle busy tab_sel
+    panes=$(zellij action list-panes --json 2>/dev/null)
+    # No reliable per-pane id to match a running Claude session on (no watcher),
+    # so reuse an idle project pane if there is one, else open a new pane.
+    tab_sel='($cur | tonumber) as $c | ([.[] | select((.is_plugin | not) and .id == $c) | .tab_id][0]) as $tab'
+    idle=$(print -r -- "$panes" | jq -r --arg name "$name" --arg cur "${ZELLIJ_PANE_ID:-0}" \
+      "$tab_sel | [.[] | select((.is_plugin | not) and .tab_id == \$tab and .title == \$name) | .id][0] // empty" 2>/dev/null)
+    if [[ -n $idle ]]; then
+      zellij action focus-pane-id "terminal_$idle"
+      zellij action write-chars --pane-id "terminal_$idle" "(cd ${(q)dir} && claude --resume ${(q)uuid})"
+      zellij action write --pane-id "terminal_$idle" 13
+      return
+    fi
+    zellij action new-pane --stacked --name "$name" --cwd "$dir" -- \
+      zsh -ic "claude --resume ${(q)uuid}; exec zsh" >/dev/null
+    return
+  fi
+  ( cd "$dir" && command claude --resume "$uuid" "${@:2}" )
+}
 
-# sn — start a new session in this directory.
-sn() { _oc_run "$@" }
+# _default_harness — print the harness sn/sc use with no -o/-c flag. Reads
+# AGENT_DEFAULT_HARNESS (config); opencode is the fallback for unset/invalid.
+_default_harness() {
+  case ${AGENT_DEFAULT_HARNESS:-opencode} in
+    claude)   print -r -- claude ;;
+    *)        print -r -- opencode ;;   # opencode is the fallback for unset/invalid
+  esac
+}
+
+# sc [-o|-c] — continue the last session in this directory.
+#   sc      the default harness (AGENT_DEFAULT_HARNESS, default opencode)
+#   sc -o   OpenCode (opencode --continue)
+#   sc -c   Claude Code (claude --continue)
+sc() {
+  local h
+  case $1 in
+    -o) shift; h=opencode ;;
+    -c) shift; h=claude ;;
+    *)  h=$(_default_harness) ;;
+  esac
+  if [[ $h == claude ]]; then _cc_run --continue "$@"; else _oc_run --continue "$@"; fi
+}
+
+# sn [-o|-c] — start a new session in this directory.
+#   sn      the default harness (AGENT_DEFAULT_HARNESS, default opencode)
+#   sn -o   OpenCode (opencode)
+#   sn -c   Claude Code (claude)
+sn() {
+  local h
+  case $1 in
+    -o) shift; h=opencode ;;
+    -c) shift; h=claude ;;
+    *)  h=$(_default_harness) ;;
+  esac
+  if [[ $h == claude ]]; then _cc_run "$@"; else _oc_run "$@"; fi
+}
+
+# _cc_run [...] — run Claude Code in this directory. Unlike _oc_run there is no
+# pane-title watcher: Claude Code has no API to poll for the new session id, so
+# the inbox cannot reverse-highlight the focused Claude row (the session still
+# appears with correct RUN/IDLE/ASK state via the transcript reader and the
+# agent-cc-log hook). Outside Zellij this is just `claude`.
+_cc_run() {
+  if ! command -v claude >/dev/null 2>&1; then
+    print -u2 "claude: not found — install Claude Code to use the -c flag"
+    return 1
+  fi
+  command claude "$@"
+}
 
 # _oc_run [...] — run opencode and keep the Zellij pane title on the session:
 #   brain - ses_e5488e86cffevKupGMvanwumSA

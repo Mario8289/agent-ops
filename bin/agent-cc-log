@@ -1,0 +1,102 @@
+#!/bin/bash
+# agent-cc-log — Claude Code hook that feeds the Agent Inbox.
+# Part of the agent-ops project: https://github.com/Mario8289/agent-ops
+#
+# Claude Code cannot load the OpenCode `agent-log` plugin, so it feeds the same
+# durable log through Claude Code's hooks mechanism instead. Wire it into
+# ~/.claude/settings.json (configure does this for you):
+#
+#   "hooks": {
+#     "UserPromptSubmit": [{ "hooks": [{ "type": "command",
+#        "command": "agent-cc-log run" }] }],
+#     "Notification":     [{ "hooks": [{ "type": "command",
+#        "command": "agent-cc-log notify" }] }],
+#     "Stop":             [{ "hooks": [{ "type": "command",
+#        "command": "agent-cc-log stop" }] }],
+#     "SubagentStop":     [{ "hooks": [{ "type": "command",
+#        "command": "agent-cc-log substop" }] }]
+#   }
+#
+# Each hook gets a JSON event on stdin. We read session_id and cwd from it and
+# append a line in the exact format agent-inbox already parses:
+#   [YYYY-MM-DD HH:MM:SS] [<id12> <project>] <STATE> <detail>
+# The id is "cc_" + the first 9 chars of the session UUID, so the 12-char tag
+# matches the "cc_"-prefixed ids that agent-cc-sessions emits.
+#
+# States, mapped from Claude Code events to the inbox's vocabulary:
+#   UserPromptSubmit -> RUNNING     (busy: the agent is working)
+#   Notification     -> WAITING     (ASK: usually a permission / idle prompt)
+#   Stop             -> IDLE        (your turn)
+#   SubagentStop     -> (logged only; no state change for the parent)
+#
+# Notifications mirror the OpenCode plugin: desktop popup via notify-send, and
+# an optional ntfy phone push when ~/.config/agent-ops/ntfy-topic exists. The
+# phone message carries only "project: status" — never commands or paths.
+[[ -r "${AGENT_OPS_CONFIG:-$HOME/.config/agent-ops/config}" ]] && source "${AGENT_OPS_CONFIG:-$HOME/.config/agent-ops/config}"
+
+set -uo pipefail
+
+LOG="${AGENT_LOG:-$HOME/agent-runs/agent_health.log}"
+CFG_DIR="${AGENT_OPS_DIR:-$HOME/.config/agent-ops}"
+mkdir -p "$(dirname "$LOG")" 2>/dev/null
+
+payload=$(cat 2>/dev/null)
+
+field() { printf '%s' "$payload" | jq -r "$1 // empty" 2>/dev/null; }
+
+session_id=$(field '.session_id')
+cwd=$(field '.cwd')
+[[ -n $cwd ]] || cwd=$PWD
+project=$(basename "$cwd" 2>/dev/null); project=${project:0:12}
+[[ -n $project ]] || project='?'
+
+# "cc_" + first 9 chars of the UUID -> a 12-char tag that matches the id
+# agent-cc-sessions builds ("cc_" + first 12 of the UUID, so the first 12 chars
+# of both share the "cc_" + 9 UUID chars the inbox matches on).
+tag="cc_${session_id:0:9} $project"
+
+stamp() { date '+%Y-%m-%d %H:%M:%S'; }
+
+write_log() { printf '[%s] [%s] %s\n' "$(stamp)" "$tag" "$1" >> "$LOG" 2>/dev/null; }
+
+# ntfy phone target, or empty when this machine has no topic file.
+phone_target() {
+  local f="$CFG_DIR/ntfy-topic" t
+  [[ -r $f ]] || return
+  t=$(head -n1 "$f" 2>/dev/null | tr -d '[:space:]')
+  [[ -n $t ]] || return
+  case $t in http://*|https://*) printf '%s' "$t" ;; *) printf 'https://ntfy.sh/%s' "$t" ;; esac
+}
+
+notify() {
+  local kind=$1 desktop=$2 phone=$3 target
+  command -v notify-send >/dev/null 2>&1 &&
+    notify-send -a "Agent Ops" "$project: $kind" "$desktop" >/dev/null 2>&1 &
+  target=$(phone_target)
+  if [[ -n $target && -n $phone ]]; then
+    local prio=default
+    [[ $kind == ASK || $kind == FAIL ]] && prio=high
+    curl -fsS -m 5 -H "Title: Agent Ops" -H "Priority: $prio" \
+      -d "$project: $phone" "$target" >/dev/null 2>&1 &
+  fi
+}
+
+case "${1:-}" in
+  run)
+    write_log "RUNNING" ;;
+  notify)
+    msg=$(field '.message'); msg=${msg:-needs your attention}
+    write_log "WAITING ${msg:0:90}"
+    notify ASK "$msg" "needs your attention" ;;
+  stop)
+    write_log "IDLE waiting for your input"
+    notify IDLE "waiting for your input" "your turn" ;;
+  substop)
+    write_log "RESUMED subagent finished" ;;
+  *)
+    echo "usage: agent-cc-log {run|notify|stop|substop}  (reads a hook event on stdin)" >&2
+    exit 2 ;;
+esac
+
+# Hooks must exit 0 or Claude Code may treat it as a failure and block.
+exit 0

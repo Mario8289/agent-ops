@@ -1,0 +1,149 @@
+#!/bin/bash
+# agent-cc-sessions — Claude Code source adapter for the Agent Inbox.
+# Part of the agent-ops project: https://github.com/Mario8289/agent-ops
+#
+#   agent-cc-sessions sessions    one TSV record per recent session
+#   agent-cc-sessions spend       rolling 24h cost
+#   agent-cc-sessions providers   "harness<TAB>id<TAB>provider" per session
+#
+# Claude Code has no server to query, so this scrapes the per-session JSONL
+# transcripts under ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl. That
+# format is private and changes between Claude Code versions — this script is
+# the ONLY place that knows it, so when it breaks, only this file needs fixing.
+# The inbox calls it through the adapter seam and treats its output exactly like
+# any other harness's.
+#
+# TSV record (matches the inbox contract, HARNESS first):
+#   harness  id  upd  busy  dir  title  tot  cost  kids  busykids  agent  model
+#
+# Field mapping (see the probes in the commit that added this):
+#   id        "cc_" + first 12 chars of the session UUID (the filename). The
+#             prefix keeps it distinct from OpenCode's "ses_" ids so the shared
+#             log matcher and session-list cache never confuse the two harnesses.
+#   upd       transcript file mtime (epoch seconds)
+#   busy      1 if touched within $CC_BUSY_WINDOW seconds, else 0. Claude Code
+#             exposes no busy flag; the agent-cc-log hook writes RUNNING/IDLE to
+#             the shared log and the inbox derives ASK/RUN/IDLE from that. This
+#             mtime heuristic is only a fallback so a live session still reads
+#             RUN before the hook is installed.
+#   dir       cwd from the last transcript line that carries one
+#   title     ai-title.title, else the last-prompt text, else "(untitled)"
+#   tot       sum of the last assistant line's usage (in+out+cache read+write)
+#   cost      cost-state.totalCostUSD (0 on some subscription sessions — real,
+#             not a bug; those plans do not report per-call cost)
+#   kids      0 for now (Claude Code sub-agents are same-file sidechains, not
+#             separate sessions; counting them is a later refinement)
+#   agent     "cc"
+#   model     last assistant line's model
+[[ -r "${AGENT_OPS_CONFIG:-$HOME/.config/agent-ops/config}" ]] && source "${AGENT_OPS_CONFIG:-$HOME/.config/agent-ops/config}"
+
+set -uo pipefail
+
+PROJECTS_DIR="${CC_PROJECTS_DIR:-$HOME/.claude/projects}"
+WINDOW=${CC_WINDOW:-86400}        # only sessions touched in this many seconds
+BUSY_WINDOW=${CC_BUSY_WINDOW:-90} # mtime-based busy fallback
+MAX=${CC_MAX:-12}                 # cap the row count, like the OpenCode query
+
+[[ -d $PROJECTS_DIR ]] || exit 0
+
+# Transcripts touched within the window, newest first, capped. Printed as
+# "mtime<TAB>path" so the caller does not re-stat each file.
+recent_files() {
+  local now cutoff
+  now=$(date +%s); cutoff=$(( now - WINDOW ))
+  find "$PROJECTS_DIR" -name '*.jsonl' -type f -printf '%T@\t%p\n' 2>/dev/null |
+    awk -F'\t' -v c="$cutoff" '{ m = int($1); if (m >= c) print m "\t" $2 }' |
+    sort -rn | head -n "$MAX"
+}
+
+# Parse one transcript into the inbox's tab-separated record. jq walks the file
+# once with `inputs`, keeping the last-seen value of each field; -R/-n makes it
+# tolerant of a trailing partial line (a transcript being written live).
+emit_session() {
+  local mtime=$1 path=$2 now=$3 id busy base uuid
+  base=${path##*/}; uuid=${base%.jsonl}
+  id="cc_${uuid:0:12}"
+  busy=0; (( now - mtime <= BUSY_WINDOW )) && busy=1
+
+  jq -rn -R --arg id "$id" --arg upd "$mtime" --arg busy "$busy" '
+    reduce (inputs | fromjson? // empty) as $l (
+      { dir: "", title: "", lastprompt: "", aititle: "",
+        cost: 0, tot: 0, model: "" };
+      ($l.type // "") as $t
+      | if ($l.cwd // null) != null then .dir = $l.cwd else . end
+      | if $t == "cost-state" then .cost = ($l.totalCostUSD // .cost) else . end
+      | if $t == "ai-title" and ($l.title // null) != null then .aititle = $l.title else . end
+      | if $t == "last-prompt" and ($l.lastPrompt // null) != null then .lastprompt = $l.lastPrompt else . end
+      | if $t == "assistant" then
+          (.model = ($l.message.model // .model))
+          | ($l.message.usage // {}) as $u
+          | .tot = (($u.input_tokens // 0) + ($u.output_tokens // 0)
+                    + ($u.cache_read_input_tokens // 0)
+                    + ($u.cache_creation_input_tokens // 0))
+        else . end
+    )
+    | (if .aititle != "" then .aititle
+       elif .lastprompt != "" then (.lastprompt | gsub("\\s+"; " "))
+       else "(untitled)" end) as $title
+    | [ "claude", $id, $upd, $busy, .dir, $title,
+        (.tot | floor), .cost, 0, 0, "cc", .model ]
+    | @tsv
+  ' "$path" 2>/dev/null
+}
+
+cmd_sessions() {
+  local now mtime path
+  now=$(date +%s)
+  while IFS=$'\t' read -r mtime path; do
+    [[ -n $path ]] || continue
+    emit_session "$mtime" "$path" "$now"
+  done < <(recent_files)
+}
+
+cmd_spend() {
+  local now mtime path total=0 c
+  now=$(date +%s)
+  while IFS=$'\t' read -r mtime path; do
+    [[ -n $path ]] || continue
+    c=$(grep -a '"type":"cost-state"' "$path" 2>/dev/null | tail -1 |
+          jq -r '.totalCostUSD // 0' 2>/dev/null)
+    [[ $c =~ ^-?[0-9] ]] || c=0
+    total=$(awk -v a="$total" -v b="$c" 'BEGIN { printf "%.6f", a + b }')
+  done < <(recent_files)
+  printf '%s' "$total"
+}
+
+# Claude Code sessions all run against Anthropic; attributing by provider lets
+# the limits line pin a quota failure on "anthropic" if a hook ever logs one.
+cmd_providers() {
+  local mtime path base uuid
+  while IFS=$'\t' read -r mtime path; do
+    [[ -n $path ]] || continue
+    base=${path##*/}; uuid=${base%.jsonl}
+    printf 'claude\tcc_%s\tanthropic\n' "${uuid:0:12}"
+  done < <(recent_files)
+}
+
+# resolve <cc_id> — map a truncated inbox id ("cc_" + first 12 UUID chars) back
+# to the full transcript. Prints "uuid<TAB>cwd" so `so` can run
+# `claude --resume <uuid>` in the right directory. Not limited to the recent
+# window: you may re-open a session older than 24h.
+cmd_resolve() {
+  local ccid=$1 frag path uuid cwd
+  frag=${ccid#cc_}
+  [[ -n $frag ]] || return 1
+  path=$(find "$PROJECTS_DIR" -name "${frag}*.jsonl" -type f 2>/dev/null | head -1)
+  [[ -n $path ]] || return 1
+  uuid=$(basename "$path" .jsonl)
+  cwd=$(grep -a '"cwd":"' "$path" 2>/dev/null | head -1 |
+          jq -rc 'select(.cwd!=null)|.cwd' 2>/dev/null)
+  printf '%s\t%s\n' "$uuid" "$cwd"
+}
+
+case "${1:-sessions}" in
+  sessions)  cmd_sessions ;;
+  spend)     cmd_spend ;;
+  providers) cmd_providers ;;
+  resolve)   cmd_resolve "${2:-}" ;;
+  *) echo "usage: agent-cc-sessions [sessions|spend|providers|resolve <cc_id>]" >&2; exit 2 ;;
+esac
