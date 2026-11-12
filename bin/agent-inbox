@@ -78,7 +78,7 @@
 [[ -r "${AGENT_OPS_CONFIG:-$HOME/.config/agent-ops/config}" ]] && source "${AGENT_OPS_CONFIG:-$HOME/.config/agent-ops/config}"
 
 LOG="${AGENT_LOG:-$HOME/agent-runs/agent_health.log}"
-BASE_NAME="Agent Inbox"
+BASE_NAME="${AGENT_INBOX_NAME:-Agent Inbox}"
 SESSION_LIST="${SESSION_LIST:-${AGENT_SESSION_LIST:-${XDG_CACHE_HOME:-$HOME/.cache}/opencode-session-list}}"
 mkdir -p "$(dirname "$SESSION_LIST")"
 

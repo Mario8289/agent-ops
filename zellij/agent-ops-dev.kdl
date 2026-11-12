@@ -1,0 +1,39 @@
+// "Agent Ops [DEV]" — the same dashboard as agent-ops.kdl, but wired to the
+// working checkout in ~/pcode/agent-ops instead of the deployed copy under
+// ~/.local/share/agent-ops. Use it to see a change in a real Zellij session
+// before you push and `chezmoi apply`.
+//
+// Differences from the deployed layout:
+//   - the tab is named "🚧 Agent Ops [DEV]" so you can never mistake it for the
+//     real one, and the inbox pane labels itself "Agent Inbox [DEV]" (via
+//     AGENT_INBOX_NAME, set by bin/dev-run);
+//   - the inbox and sys panes run the pcode binaries by absolute path, so the
+//     session uses your edits regardless of $PATH.
+//
+// Launch it with `bin/dev-run` (sets PATH + session name + dev shell helpers),
+// or directly:  zellij --layout zellij/agent-ops-dev.kdl --session agentops-dev
+//
+// Shell helpers (so/sa/sd) in the project pane still come from whatever your
+// shell sourced; dev-run sources the pcode copy for you.
+
+layout {
+    default_tab_template {
+        pane size=1 borderless=true {
+            plugin location="zellij:tab-bar"
+        }
+        children
+        pane size=2 borderless=true {
+            plugin location="zellij:status-bar"
+        }
+    }
+
+    tab name="🚧 Agent Ops [DEV]" {
+        pane split_direction="horizontal" {
+            pane name="Agent Inbox [DEV]" command="/home/marriotta/pcode/agent-ops/bin/agent-inbox" size="21%"
+            pane stacked=true size="70%" {
+                pane name="home" cwd="/home/marriotta/pcode/agent-ops" focus=true expanded=true
+            }
+            pane name="System" command="/home/marriotta/pcode/agent-ops/bin/sys" size="9%"
+        }
+    }
+}

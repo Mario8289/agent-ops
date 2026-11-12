@@ -1,0 +1,37 @@
+#!/usr/bin/env zsh
+# dev-run — launch an Agent Ops dashboard from this working checkout, clearly
+# marked as the dev copy, so you can test a change before you push and
+# `chezmoi apply --refresh-externals` rolls it into the deployed copy.
+#
+# What it does:
+#   - puts this repo's bin/ first on PATH, so agent-inbox/sys/agent-limits and
+#     the shell helpers' subcommands all resolve to your edits;
+#   - sets AGENT_INBOX_NAME so the inbox pane reads "Agent Inbox [DEV]";
+#   - launches Zellij with the dev layout under the session name "agentops-dev",
+#     so it sits beside (never on top of) your real agent-ops session.
+#
+# The deployed dashboard is untouched: this only affects the session it starts.
+set -eu
+
+REPO="${0:A:h:h}"   # bin/dev-run -> repo root
+
+if ! command -v zellij >/dev/null 2>&1; then
+  print -u2 "dev-run: zellij not found on PATH"
+  exit 1
+fi
+
+export PATH="$REPO/bin:$PATH"
+export AGENT_INBOX_NAME="Agent Inbox [DEV]"
+
+# Make the dev shell helpers (so/sa/sd/...) available in the project pane's
+# shell too, not just the deployed ones your ~/.zshrc sources. Zellij panes
+# start a login shell, so export a marker the shell can pick up if you add a
+# guard to your rc; harmless otherwise.
+export AGENT_OPS_DEV_SHELL="$REPO/shell/agent-ops.zsh"
+
+print -r -- "dev-run: launching Agent Ops [DEV] from $REPO"
+print -r -- "         session 'agentops-dev' — your deployed dashboard is untouched"
+
+exec zellij \
+  --session agentops-dev \
+  --layout "$REPO/zellij/agent-ops-dev.kdl"
