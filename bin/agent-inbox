@@ -633,12 +633,15 @@ while true; do
     fi
 
     # Archived ("done") sessions are hidden from the live pane — unless they
-    # need you again (ASK/FAIL/DEAD/STOP), in which case show them and clear the
-    # mark so "done" can never bury something urgent. In --all mode nothing is
-    # archived (ARCHIVED is empty), so every row is shown and flagged below.
+    # need you again (ASK/FAIL/DEAD), in which case show them and clear the mark
+    # so "done" can never bury something urgent. STOP is excluded: an interrupt
+    # is usually something you did deliberately, so archiving a stopped session
+    # keeps it hidden rather than resurfacing it every tick. In --all mode
+    # nothing is archived (ARCHIVED is empty), so every row is shown and flagged
+    # below.
     if [[ -n ${ARCHIVED[$id]:-} ]]; then
       case $st in
-        ASK|FAIL|DEAD|STOP) UNARCHIVE+=("$id"); unset "ARCHIVED[$id]" ;;
+        ASK|FAIL|DEAD) UNARCHIVE+=("$id"); unset "ARCHIVED[$id]" ;;
         *) continue ;;
       esac
     fi

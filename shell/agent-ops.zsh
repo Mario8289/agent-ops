@@ -141,7 +141,9 @@ _session_label() {
 # it from the live Agent Inbox without deleting its transcript. -u un-archives.
 # Works for both OpenCode (ses_) and Claude Code (cc_) rows — archiving is just
 # a mark on your side, harness-agnostic. The inbox auto-unarchives a session
-# that later goes ASK/FAIL/DEAD, so "done" can never bury something urgent.
+# that later goes ASK/FAIL/DEAD, so "done" can never bury something urgent. A
+# STOP (interrupted) session stays archived — an interrupt is usually your own
+# doing, so "done" keeps it hidden.
 # Browse archived (and aged-out) sessions any time with `sl`. Prints the
 # session's title/project so you can catch a row-number mismatch (rows re-sort).
 sa() {

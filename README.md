@@ -226,9 +226,11 @@ it from the live inbox (the transcript is kept — this is the non-destructive
 version of `sd`). Archived sessions live in `~/.config/agent-ops/archived` (one
 id per line; delete the file to clear all marks).
 
-An archived session that later needs you — goes `ASK`/`FAIL`/`DEAD`/`STOP` —
+An archived session that later needs you — goes `ASK`/`FAIL`/`DEAD` —
 **reappears automatically and its mark is cleared**, so "done" can never bury
-something urgent. To see archived (and aged-out) sessions any time, run `sl`.
+something urgent. A `STOP` (interrupted) session is the exception: an interrupt
+is usually something you did on purpose, so archiving it keeps it hidden. To see
+archived (and aged-out) sessions any time, run `sl`.
 
 ## How it works
 
