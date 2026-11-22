@@ -68,7 +68,8 @@ session's busy/idle timestamps.
 
 Dependencies: `jq`, `zellij`, `git`, `curl`, `opencode` (and `notify-send` for
 desktop popups, `docker` for the sys pane, `gh` for the PR/CI column,
-`claude` for the Claude Code harness).
+`claude` for the Claude Code harness, `aws` for the AWS CLI v2: `sudo snap install aws-cli --classic` on Ubuntu, otherwise see the
+[install guide](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html)).
 
 ```sh
 git clone https://github.com/Mario8289/agent-ops.git
