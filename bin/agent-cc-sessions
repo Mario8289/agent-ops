@@ -7,6 +7,9 @@
 #   agent-cc-sessions providers   "harness<TAB>id<TAB>provider" per session
 #   agent-cc-sessions resolve <cc_id>   "uuid<TAB>cwd" for re-opening
 #   agent-cc-sessions path <cc_id>      the transcript file path (for deletion)
+#   agent-cc-sessions newest-since <dir> <epoch>   newest session id in <dir>
+#                                       touched at/after <epoch> (for the pane
+#                                       watcher); prints "cc_<id12>" or nothing
 #
 # Claude Code has no server to query, so this scrapes the per-session JSONL
 # transcripts under ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl. That
@@ -155,11 +158,39 @@ cmd_path() {
   printf '%s\n' "$path"
 }
 
+# newest-since <dir> <epoch> — print the "cc_"-prefixed id of the most recently
+# touched transcript whose recorded cwd is <dir> and whose mtime is at/after
+# <epoch>, or nothing. The pane watcher in _cc_run polls this to learn which
+# session a fresh `claude` created (Claude Code has no live session API). Reading
+# cwd from inside the transcript avoids guessing Claude's dir-encoding scheme.
+# Matches both a brand-new session (new file) and a resumed one (existing file
+# whose mtime jumps past <epoch>).
+cmd_newest_since() {
+  local dir=$1 since=$2 now mtime path cwd
+  [[ -n $dir && $since =~ ^[0-9]+$ ]] || return 1
+  now=$(date +%s)
+  # Walk candidates newest-first and return the first whose cwd matches, so one
+  # stat/read is enough in the common case. recent_files already sorts by mtime.
+  find "$PROJECTS_DIR" -name '*.jsonl' -type f -newermt "@$(( since - 1 ))" -printf '%T@\t%p\n' 2>/dev/null |
+    sort -rn |
+    while IFS=$'\t' read -r mtime path; do
+      [[ -n $path ]] || continue
+      cwd=$(grep -a '"cwd":"' "$path" 2>/dev/null | head -1 |
+              jq -rc 'select(.cwd!=null)|.cwd' 2>/dev/null)
+      if [[ $cwd == "$dir" ]]; then
+        local base uuid; base=${path##*/}; uuid=${base%.jsonl}
+        printf 'cc_%s\n' "${uuid:0:12}"
+        return 0
+      fi
+    done
+}
+
 case "${1:-sessions}" in
   sessions)  cmd_sessions ;;
   spend)     cmd_spend ;;
   providers) cmd_providers ;;
   resolve)   cmd_resolve "${2:-}" ;;
   path)      cmd_path "${2:-}" ;;
-  *) echo "usage: agent-cc-sessions [sessions|spend|providers|resolve <cc_id>|path <cc_id>]" >&2; exit 2 ;;
+  newest-since) cmd_newest_since "${2:-}" "${3:-}" ;;
+  *) echo "usage: agent-cc-sessions [sessions|spend|providers|resolve <cc_id>|path <cc_id>|newest-since <dir> <epoch>]" >&2; exit 2 ;;
 esac

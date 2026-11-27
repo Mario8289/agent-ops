@@ -210,7 +210,7 @@ before you type it, since rows re-sort as states change.
 |---|---|
 | `so <row\|id>` | open/focus a session (OpenCode or Claude Code — auto-detected from the id) |
 | `sd [-i] <row\|id>` | delete an OpenCode session and its children (`-i` to confirm) |
-| `sa <row\|id>` | archive ("I'm done") — hide it from the live inbox without deleting |
+| `sa <row\|id>` | archive ("I'm done") — hide it from the live inbox without deleting; asks first (rows re-sort), `-y` to skip |
 | `sa -u <row\|id>` | un-archive |
 | `sl` | list the full long tail: every session in the window, uncapped, archived rows flagged — a one-shot snapshot, safe to pipe to `grep` |
 | `sn [-o\|-c]` | start a new session here (`-o` OpenCode, `-c` Claude Code; no flag = `AGENT_DEFAULT_HARNESS`, default OpenCode) |
@@ -222,10 +222,12 @@ before you type it, since rows re-sort as states change.
 
 Neither harness has a "finished" flag — a session is just a conversation you can
 resume, so `IDLE` means both "its turn is done" and "it's waiting for your next
-prompt". When you're actually done with one, `sa <row>` marks it done and hides
-it from the live inbox (the transcript is kept — this is the non-destructive
-version of `sd`). Archived sessions live in `~/.config/agent-ops/archived` (one
-id per line; delete the file to clear all marks).
+prompt". When you're actually done with one, `sa <row>` shows the session it
+resolved to (rows re-sort, so the number you saw may have moved) and, after you
+confirm, marks it done and hides it from the live inbox (the transcript is kept
+— this is the non-destructive version of `sd`). Pass `-y` to skip the prompt.
+Archived sessions live in `~/.config/agent-ops/archived` (one id per line;
+delete the file to clear all marks).
 
 An archived session that later needs you — goes `ASK`/`FAIL`/`DEAD` —
 **reappears automatically and its mark is cleared**, so "done" can never bury

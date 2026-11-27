@@ -549,12 +549,14 @@ while true; do
   [[ -z $budget && -r $BUDGET_FILE ]] && budget=$(head -n1 "$BUDGET_FILE" 2>/dev/null | tr -d '[:space:]')
 
   # Which session is in the pane that has focus right now? `so`/`sc`/`sn` put the ID in
-  # the pane title; anything else (a plain shell, this pane) yields nothing.
+  # the pane title; anything else (a plain shell, this pane) yields nothing. Both
+  # harnesses now tag the title: ses_… (OpenCode, _oc_run) and cc_… (Claude,
+  # _cc_run), so accept either prefix.
   focused_ses=
   if [[ -n ${ZELLIJ_PANE_ID:-} ]]; then
     focused_ses=$(zellij action list-panes --json 2>/dev/null |
       jq -r '[.[] | select(.is_focused and (.is_plugin | not)) | .title][0] // empty' 2>/dev/null |
-      grep -oE 'ses_[A-Za-z0-9]{20,}' | head -n 1)
+      grep -oE '(ses_[A-Za-z0-9]{20,}|cc_[A-Za-z0-9-]{10,})' | head -n 1)
   fi
 
   unset ev; declare -A ev=()
